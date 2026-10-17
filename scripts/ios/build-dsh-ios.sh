@@ -207,8 +207,8 @@ echo "== [5/6] 组装 deb 目录 =="
 DEB=/tmp/dsh-deb
 rm -rf "$DEB" && mkdir -p "$DEB/DEBIAN" "$DEB/usr/local/bin" "$DEB/usr/local/lib"
 cp -a "$NM" "$DEB/usr/local/lib/node_modules"
-cp "$SCRIPT_DIR/fetch-shim.cjs" "$DEB/usr/local/lib/fetch-shim.cjs"
-chmod 644 "$DEB/usr/local/lib/fetch-shim.cjs"
+cp "$SCRIPT_DIR/fetch-shim.mjs" "$DEB/usr/local/lib/fetch-shim.mjs"
+chmod 644 "$DEB/usr/local/lib/fetch-shim.mjs"
 
 # 所有入口都走同一套 node 参数。
 #
@@ -255,7 +255,7 @@ fi
 
 NODE="$BIN/node"
 ENTRY="$LIB/node_modules/@deepseek-ai/dsh/lib/bin.js"
-SHIM="$LIB/fetch-shim.cjs"
+SHIM="$LIB/fetch-shim.mjs"
 
 if [ ! -x "$NODE" ]; then
   echo "dsh: node not found at $NODE (install the nodejs package first)" >&2
@@ -280,7 +280,11 @@ if [ "${DSH_IOS_JIT:-0}" != "1" ]; then
   FLAGS="--jitless $FLAGS"
 fi
 
-exec "$NODE" $FLAGS --expose-internals --require "$SHIM" "$ENTRY" "$@"
+# --import (ESM preload), NOT --require: under --jitless undici references
+# WebAssembly in its own module scope, and only an ESM preload runs early enough
+# to install our undici-free Request/Response/Headers/fetch before Node lazy
+# getters can load undici (which would crash in llhttp).
+exec "$NODE" $FLAGS --expose-internals --import "$SHIM" "$ENTRY" "$@"
 EOF
 chmod 755 "$DEB/usr/local/bin/dsh"
 
@@ -346,8 +350,8 @@ if [ -f "$P/bin/node" ] && command -v ldid >/dev/null 2>&1; then
   fi
 fi
 
-if [ ! -f "$P/lib/fetch-shim.cjs" ]; then
-  log "WARN: /usr/local/lib/fetch-shim.cjs missing - dsh will not start"
+if [ ! -f "$P/lib/fetch-shim.mjs" ]; then
+  log "WARN: /usr/local/lib/fetch-shim.mjs missing - dsh will not start"
 fi
 
 if command -v ldid >/dev/null 2>&1; then
@@ -383,14 +387,16 @@ chmod 755 "$DEB/DEBIAN/postinst"
 echo "== [6/6] 打包前自检 =="
 fail=0
 check(){ if [ -e "$1" ]; then echo "  ok   $2"; else echo "  MISS $2"; fail=1; fi; }
-check "$DEB/usr/local/lib/fetch-shim.cjs" "fetch-shim.cjs"
+check "$DEB/usr/local/lib/fetch-shim.mjs" "fetch-shim.mjs"
 check "$DEB/usr/local/bin/dsh-ios" "launcher dsh-ios"
 check "$DEB/usr/local/lib/node_modules/@deepseek-ai/dsh/lib/bin.js" "dsh entry"
 check "$DEB/usr/local/lib/node_modules/node-pty/build/Release/pty.node" "node-pty addon"
 grep -q 'dsh-ios-polyfill' "$DEB/usr/local/lib/node_modules/@deepseek-ai/dsh-web-frontend/dist/index.html" \
   && echo "  ok   web polyfill" || { echo "  MISS web polyfill"; fail=1; }
-grep -q 'fetch-shim.cjs' "$DEB/usr/local/bin/dsh" \
-  && echo "  ok   launcher requires fetch-shim" || { echo "  MISS launcher fetch-shim wiring"; fail=1; }
+grep -q 'fetch-shim.mjs' "$DEB/usr/local/bin/dsh" \
+  && echo "  ok   launcher imports fetch-shim" || { echo "  MISS launcher fetch-shim wiring"; fail=1; }
+grep -q '--import' "$DEB/usr/local/bin/dsh" \
+  && echo "  ok   launcher uses --import (ESM preload)" || { echo "  MISS --import"; fail=1; }
 if [ "$fail" != "0" ]; then echo "打包自检失败"; exit 1; fi
 
 dpkg-deb -b --root-owner-group -Zgzip "$DEB" "$ROOT/dist/dsh-ios_${DEB_VER}_${DEB_ARCH}.deb" >/dev/null
