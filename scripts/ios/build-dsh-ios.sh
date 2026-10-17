@@ -227,18 +227,35 @@ cat > "$DEB/usr/local/bin/dsh" <<'EOF'
 # sees the merged, jbroot-prefixed view; a plain iOS process like node sees the
 # real root. Every path handed to node must be translated, or it ENOENTs.
 
-JB=""
-if command -v jbroot >/dev/null 2>&1; then
-  JB="$(jbroot 2>/dev/null)" || JB=""
-fi
-if [ -z "$JB" ]; then
-  JB="${JBROOT:-}"
-fi
-[ -n "$JB" ] || JB="/"
+# The real (kernel) path of a shell-visible directory. `cd` goes through the
+# shell's rootHide interposition and `pwd -P` then reports the physical path,
+# which is exactly the view a plain iOS process like node has. This is more
+# robust than `jbroot`: jbroot is a jailbreak binary that lives in
+# ${JBROOT}/basebin, and that directory is NOT on PATH under `sudo -i`, so a
+# launcher that depends on it silently falls back to un-prefixed paths and loads
+# the wrong files (observed: shim present but never applied).
+realpath_of() {
+  (cd "$1" 2>/dev/null && pwd -P) 2>/dev/null
+}
 
-NODE="${JB}usr/local/bin/node"
-ENTRY="${JB}usr/local/lib/node_modules/@deepseek-ai/dsh/lib/bin.js"
-SHIM="${JB}usr/local/lib/fetch-shim.cjs"
+LIB="$(realpath_of /usr/local/lib)"
+BIN="$(realpath_of /usr/local/bin)"
+
+# Fall back to jbroot / JBROOT if the cd+pwd trick is unavailable.
+if [ -z "$LIB" ] || [ -z "$BIN" ]; then
+  JB=""
+  if command -v jbroot >/dev/null 2>&1; then
+    JB="$(jbroot 2>/dev/null)" || JB=""
+  fi
+  [ -n "$JB" ] || JB="${JBROOT:-}"
+  [ -n "$JB" ] || JB="/"
+  [ -n "$LIB" ] || LIB="${JB}usr/local/lib"
+  [ -n "$BIN" ] || BIN="${JB}usr/local/bin"
+fi
+
+NODE="$BIN/node"
+ENTRY="$LIB/node_modules/@deepseek-ai/dsh/lib/bin.js"
+SHIM="$LIB/fetch-shim.cjs"
 
 if [ ! -x "$NODE" ]; then
   echo "dsh: node not found at $NODE (install the nodejs package first)" >&2
@@ -254,7 +271,7 @@ fi
 # spawns (the bash tool, node-pty's shell) only resolves if the jbroot bin
 # directories are on PATH. Without this, spawn fails with ENOENT and it looks
 # like a sandbox denial.
-export PATH="${JB}usr/bin:${JB}bin:${JB}usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
+export PATH="$BIN:${JBROOT:-}usr/bin:${JBROOT:-}bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
 export DSH_HOME="${DSH_HOME:-${HOME:-/var/mobile}/.dsh}"
 
 # --predictable --single-threaded: required by the patched V8 W^X path.
