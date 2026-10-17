@@ -72,7 +72,12 @@ module.exports = mod;
 module.exports.default = mod;
 `;
 
-const UNDICI_URL = "dsh-undici-stub:index";
+// Must be a REAL file URL: ESM import() rejects custom schemes
+// (ERR_UNSUPPORTED_ESM_URL_SCHEME), and when that happens Node falls back to
+// loading the genuine undici, which is exactly the crash we are preventing.
+// undici-stub.cjs ships next to this file, so import.meta.url resolves to the
+// jbroot-prefixed real path on device, which is what node can open.
+const UNDICI_URL = new URL("./undici-stub.cjs", import.meta.url).href;
 const isUndici = (spec) =>
   spec === "undici" ||
   spec === "node:undici" ||
@@ -91,7 +96,8 @@ if (typeof module.registerHooks === "function") {
     },
     load(url, context, nextLoad) {
       if (url === UNDICI_URL) {
-        return { format: "commonjs", source: UNDICI_STUB, shortCircuit: true };
+        // File really exists; let node load it normally.
+        return nextLoad(url, context);
       }
       return nextLoad(url, context);
     },

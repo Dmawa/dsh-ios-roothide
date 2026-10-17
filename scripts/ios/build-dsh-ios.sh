@@ -318,6 +318,10 @@ rm -rf "$DEB" && mkdir -p "$DEB/DEBIAN" "$DEB/usr/local/bin" "$DEB/usr/local/lib
 cp -a "$NM" "$DEB/usr/local/lib/node_modules"
 cp "$SCRIPT_DIR/fetch-shim.mjs" "$DEB/usr/local/lib/fetch-shim.mjs"
 chmod 644 "$DEB/usr/local/lib/fetch-shim.mjs"
+# The loader target for module.registerHooks must be a real file next to the
+# shim (ESM import() rejects custom URL schemes).
+cp "$SCRIPT_DIR/undici-stub.cjs" "$DEB/usr/local/lib/undici-stub.cjs"
+chmod 644 "$DEB/usr/local/lib/undici-stub.cjs"
 
 # 所有入口都走同一套 node 参数。
 #
@@ -501,6 +505,7 @@ echo "== [6/6] 打包前自检 =="
 fail=0
 check(){ if [ -e "$1" ]; then echo "  ok   $2"; else echo "  MISS $2"; fail=1; fi; }
 check "$DEB/usr/local/lib/fetch-shim.mjs" "fetch-shim.mjs"
+check "$DEB/usr/local/lib/undici-stub.cjs" "undici-stub.cjs (loader target)"
 check "$DEB/usr/local/lib/node_modules/undici/index.mjs" "undici stub"
 check "$DEB/usr/local/bin/dsh-ios" "launcher dsh-ios"
 check "$DEB/usr/local/lib/node_modules/@deepseek-ai/dsh/lib/bin.js" "dsh entry"
