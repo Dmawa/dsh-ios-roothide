@@ -227,30 +227,34 @@ cat > "$DEB/usr/local/bin/dsh" <<'EOF'
 # sees the merged, jbroot-prefixed view; a plain iOS process like node sees the
 # real root. Every path handed to node must be translated, or it ENOENTs.
 
-# The real (kernel) path of a shell-visible directory. `cd` goes through the
-# shell's rootHide interposition and `pwd -P` then reports the physical path,
-# which is exactly the view a plain iOS process like node has. This is more
-# robust than `jbroot`: jbroot is a jailbreak binary that lives in
-# ${JBROOT}/basebin, and that directory is NOT on PATH under `sudo -i`, so a
-# launcher that depends on it silently falls back to un-prefixed paths and loads
-# the wrong files (observed: shim present but never applied).
-realpath_of() {
-  (cd "$1" 2>/dev/null && pwd -P) 2>/dev/null
-}
+# node is a plain iOS process: it does NOT get rootHide's path interposition, so
+# it needs the jbroot-prefixed *real* path. `jbroot` (no argument) prints that
+# root, trailing slash included. Note `pwd -P` is NOT a substitute here: under
+# rootHide it reports the virtual path (/usr/local/lib), which node cannot open
+# -- that mismatch produced "Cannot find module '/usr/local/lib/fetch-shim.mjs'".
+JB=""
+if command -v jbroot >/dev/null 2>&1; then
+  JB="$(jbroot 2>/dev/null)" || JB=""
+fi
+[ -n "$JB" ] || JB="${JBROOT:-}"
+[ -n "$JB" ] || JB="/"
+case "$JB" in
+  */) ;;
+  *) JB="$JB/" ;;
+esac
 
-LIB="$(realpath_of /usr/local/lib)"
-BIN="$(realpath_of /usr/local/bin)"
+LIB="${JB}usr/local/lib"
+BIN="${JB}usr/local/bin"
 
-# Fall back to jbroot / JBROOT if the cd+pwd trick is unavailable.
-if [ -z "$LIB" ] || [ -z "$BIN" ]; then
-  JB=""
-  if command -v jbroot >/dev/null 2>&1; then
-    JB="$(jbroot 2>/dev/null)" || JB=""
+# Not every jailbreak needs the prefix (rootless/plain Procursus usually does
+# not). If the prefixed node is not there, fall back to the shell view.
+if [ ! -x "$BIN/node" ]; then
+  ALT_BIN="$( (cd /usr/local/bin 2>/dev/null && pwd -P) 2>/dev/null )"
+  ALT_LIB="$( (cd /usr/local/lib 2>/dev/null && pwd -P) 2>/dev/null )"
+  if [ -n "$ALT_BIN" ] && [ -x "$ALT_BIN/node" ]; then
+    BIN="$ALT_BIN"
+    [ -n "$ALT_LIB" ] && LIB="$ALT_LIB"
   fi
-  [ -n "$JB" ] || JB="${JBROOT:-}"
-  [ -n "$JB" ] || JB="/"
-  [ -n "$LIB" ] || LIB="${JB}usr/local/lib"
-  [ -n "$BIN" ] || BIN="${JB}usr/local/bin"
 fi
 
 NODE="$BIN/node"
@@ -271,7 +275,7 @@ fi
 # spawns (the bash tool, node-pty's shell) only resolves if the jbroot bin
 # directories are on PATH. Without this, spawn fails with ENOENT and it looks
 # like a sandbox denial.
-export PATH="$BIN:${JBROOT:-}usr/bin:${JBROOT:-}bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
+export PATH="$BIN:${JB}usr/bin:${JB}bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
 export DSH_HOME="${DSH_HOME:-${HOME:-/var/mobile}/.dsh}"
 
 # --predictable --single-threaded: required by the patched V8 W^X path.
