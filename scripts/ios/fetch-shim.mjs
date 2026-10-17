@@ -30,6 +30,73 @@
 
 import http from "node:http";
 import https from "node:https";
+import module from "node:module";
+
+// ---------------------------------------------------------------------------
+// Hard block on undici — BOTH the npm package and Node's built-in copy.
+// ---------------------------------------------------------------------------
+// Node 22 backs several globals with undici (fetch/Headers/Request/Response/
+// FormData/Blob/File/WebSocket/EventSource/MessageEvent/CloseEvent). We replace
+// those below, but that is not enough: any *other* consumer that imports undici
+// directly -- dsh-web-fetch-http, dsh-http-proxy, or anything Node itself pulls
+// in -- still loads it, and undici's bundled llhttp is WebAssembly, which does
+// not exist under --jitless. Its module-scope `WebAssembly` reference is baked
+// into Node's startup snapshot, so patching globalThis cannot help.
+//
+// Therefore: intercept module resolution and hand every undici import a pure-JS
+// stub. This is the only reliable way to keep llhttp out of the process.
+const UNDICI_STUB = String.raw`
+"use strict";
+class Dispatcher { constructor(o){ this.options = o || {}; } dispatch(){ return false; } close(){ return Promise.resolve(); } destroy(){ return Promise.resolve(); } }
+class Agent extends Dispatcher {}
+class Pool extends Dispatcher {}
+class ProxyAgent extends Dispatcher {}
+class Client extends Dispatcher {}
+let globalDispatcher = new Agent();
+function getGlobalDispatcher(){ return globalDispatcher; }
+function setGlobalDispatcher(d){ globalDispatcher = d; }
+function fetch(input, init){ const r = Object.assign({}, init); delete r.dispatcher; return globalThis.fetch(input, r); }
+function unsupported(n){ return function(){ throw new Error("undici." + n + " is not available on this iOS build (use fetch)"); }; }
+const mod = {
+  Agent, Pool, ProxyAgent, Client, Dispatcher,
+  getGlobalDispatcher, setGlobalDispatcher, fetch,
+  request: unsupported("request"), stream: unsupported("stream"),
+  pipeline: unsupported("pipeline"), connect: unsupported("connect"),
+  upgrade: unsupported("upgrade"),
+  Headers: globalThis.Headers, Request: globalThis.Request,
+  Response: globalThis.Response, FormData: globalThis.FormData,
+  WebSocket: globalThis.WebSocket,
+  errors: {}, buildConnector: unsupported("buildConnector"),
+};
+module.exports = mod;
+module.exports.default = mod;
+`;
+
+const UNDICI_URL = "dsh-undici-stub:index";
+const isUndici = (spec) =>
+  spec === "undici" ||
+  spec === "node:undici" ||
+  spec === "internal/deps/undici/undici" ||
+  spec === "node:internal/deps/undici/undici" ||
+  spec.startsWith("undici/") ||
+  spec.startsWith("node:internal/deps/undici/");
+
+if (typeof module.registerHooks === "function") {
+  module.registerHooks({
+    resolve(specifier, context, nextResolve) {
+      if (isUndici(specifier)) {
+        return { url: UNDICI_URL, format: "commonjs", shortCircuit: true };
+      }
+      return nextResolve(specifier, context);
+    },
+    load(url, context, nextLoad) {
+      if (url === UNDICI_URL) {
+        return { format: "commonjs", source: UNDICI_STUB, shortCircuit: true };
+      }
+      return nextLoad(url, context);
+    },
+  });
+}
 
 const FETCH_BASE = process.env.DSH_IOS_FETCH_BASE || "http://127.0.0.1:3080";
 const DEFAULT_UA = process.env.DSH_IOS_FETCH_UA || "node";
@@ -498,6 +565,47 @@ class WebSocket {
     throw new Error("WebSocket is not available on this iOS build (undici-free shim)");
   }
 }
+
+// Node 22 backs EventSource / ErrorEvent with undici as well. Reading either of
+// them loads the built-in undici module (and thus llhttp/wasm). dsh's LLM SSE
+// path touches EventSource, so these must be owned here too. The registerHooks
+// block above is the backstop if something else still pulls undici in.
+// Minimal EventSource: enough surface that feature-detection and construction
+// fail cleanly rather than crashing the process.
+class EventSource {
+  static CONNECTING = 0;
+  static OPEN = 1;
+  static CLOSED = 2;
+
+  constructor(url, init) {
+    this.url = String(url);
+    this.readyState = 2;
+    this.withCredentials = Boolean(init && init.withCredentials);
+    this.onerror = null;
+    this.onopen = null;
+    this.onmessage = null;
+    // Defer so the caller can attach listeners, then report unsupported.
+    setTimeout(() => {
+      const err = new Error(
+        "EventSource is not available on this iOS build (undici-free shim); use fetch + stream instead"
+      );
+      if (typeof this.onerror === "function") {
+        try { this.onerror(new ErrorEvent("error", { error: err, message: err.message })); } catch {}
+      }
+    }, 0);
+  }
+  addEventListener() {}
+  removeEventListener() {}
+  close() { this.readyState = 2; }
+}
+
+class ErrorEvent {
+  constructor(type, init = {}) {
+    this.type = String(type);
+    this.message = init.message || "";
+    this.error = init.error === undefined ? null : init.error;
+  }
+}
 // ---------------------------------------------------------------------------
 // Take over the globals BEFORE Node's lazy undici getters can fire.
 // ---------------------------------------------------------------------------
@@ -528,6 +636,8 @@ define("FormData", FormData);
 define("MessageEvent", MessageEvent);
 define("CloseEvent", CloseEvent);
 define("WebSocket", WebSocket);
+define("EventSource", EventSource);
+define("ErrorEvent", ErrorEvent);
 
 // Always expose the install result so a device-side smoke test can assert it:
 //     node --jitless --import <shim> -e "console.log(globalThis.__dshShim)"
