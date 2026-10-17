@@ -17,17 +17,30 @@ RootHide 包在 deb 内直接使用 `/usr/local/...` 布局，由 RootHide 的�
 | `scripts/ios/apply_patches.py` | 源码补丁（幂等）：node / node-pty / V8 W^X |
 | `scripts/ios/build-node-ios.sh` | 编译 Node 22 → nodejs deb |
 | `scripts/ios/build-dsh-ios.sh` | 编译 node-pty addon + 打包 dsh 全量依赖 → dsh-ios deb |
+| `scripts/ios/fetch-shim.cjs` | 运行时垫片：stub WebAssembly + 把 `fetch` 改走 `node:http`（打包进 deb，launcher 预加载） |
+| `scripts/ios/inject-web-polyfill.py` | 构建时给前端 `index.html` 注入 `AbortSignal.any` / `timeout` polyfill（幂等） |
 | `ios-sdk-shim/mach/mach_vm.h` | iOS SDK 缺失的 mach_vm 声明（libSystem 运行时实际导出） |
 
-> 独立的 **Node.js-for-ios 配方仓库**：[`ddddddedcds/Node.js-for-ios`](https://github.com/ddddddedcds/Node.js-for-ios)
-> （V8 W^X 补丁脚本 / ninja 修复 / fetch-shim / launcher / clang 包装 / CI，附真机验证状态）。
+> 原配方仓库 `dddddedcds/Node.js-for-ios`（V8 W^X 补丁 / ninja 修复 / fetch-shim / launcher / clang 包装 / CI）**已从 GitHub 删除**。
+> 本仓库的 `scripts/ios/fetch-shim.cjs` 是按它文档化的行为契约重写的；其余脚本一直就在本仓库里。
 
 ## 安装（设备端，root）
 
 ```sh
-dpkg -i nodejs_22.23.2-1_iphoneos-arm64e.deb dsh-ios_0.1.1-rc.2-1_iphoneos-arm64e.deb
-dsh-ios    # 浏览器打开 http://127.0.0.1:3080
+# 1. 装包（顺序不能反，dsh-ios 依赖 nodejs）
+dpkg -i nodejs_22.23.2-1_iphoneos-arm64e.deb
+dpkg -i dsh-ios_0.1.7-rc.2-1_iphoneos-arm64e.deb
+
+# 2. 给 node 本体签名 + 进 trustcache（只需一次；nodejs 包不含这一步）
+sudo ldid -M -S /usr/local/lib/nodejs/entitlements.plist /usr/local/bin/node
+sudo "$(jbroot /basebin/jbctl)" trustcache add "$(jbroot /usr/local/bin/node)"
+
+# 3. 启动
+dsh-ios          # 然后 Safari 打开 http://127.0.0.1:3080
 ```
+
+`fetch-shim.cjs`、前端 polyfill、node-pty 的签名与 trustcache 都已由包内 postinst 自动处理，
+**不需要再手工下发任何文件**。
 
 ## 关键设计决策
 
@@ -86,7 +99,13 @@ A14 上 wasm 双路径都崩（见上），且 `--jitless` 时代还叠加 wasm 
   `Request`/`Response`/`Headers` **全局类也禁掉**，dsh 插件树（webRuntime→connection→apiProxy 链）
   启动时依赖这些类 → apiProxy 服务静默不激活 → 所有 `/api/*` 返回 404
 
-launcher 完整参数见「推荐启动姿势」。
+**垫片现在随包发布**：源码在 `scripts/ios/fetch-shim.cjs`，构建时复制到 `/usr/local/lib/fetch-shim.cjs`，
+并由 `/usr/local/bin/dsh` 用 `--require` 预加载。打包自检（`build-dsh-ios.sh` 第 6 步）会校验它确实在包里、
+且 launcher 确实引用了它——不会再出现"文档说有、包里没有"的情况。
+
+> 历史备注：0.1.1 那版 deb 确实漏装了垫片（原作者是在设备上手工补的）。本仓库的 `fetch-shim.cjs` 是按上面
+> 的行为契约重写的（原配方仓库 `dddddedcds/Node.js-for-ios` 已 404），本地 19 项用例覆盖 GET/POST/SSE/
+> AbortSignal.timeout/相对 URL/重定向/HTTPS。
 
 ## 真机验证记录（iPhone 12 Pro Max, A14, iOS 16.7, Dopamine rootless）
 
@@ -145,17 +164,37 @@ export default class LocalSubprocessRuntime extends SubprocessRuntime {
 聊天气泡、Web UI、文件、会话等核心功能不受影响。若后续需要真 koffi，可交叉编译
 （node-gyp，纯 C，15–30 分钟量级）。
 
-> ✅ **stub 已固化进 deb**：iOS 包已内嵌两个插件 stub（`dsh-sandbox-local`/`dsh-subprocess-local` 的 `lib/index.js`），重装设备不会回到 koffi 硬挡。
+> ⚠️ **0.1.7 起默认不打 stub**：`dsh-win32-process` 里的 koffi 已改成 `createLazyRequire` 惰性加载，
+> `node-addon-system` 的 flock 绑定也是函数内 require，所以启动时不再硬碰 koffi。真机若发现启动被挡，
+> 构建时加 `DSH_IOS_STUB_PLUGINS=1` 即可把两个插件换成上面的惰性 stub（脚本里已内置这段）。
 
 ### 推荐启动姿势（dsh）
+
+包里已经装好两个入口，**直接敲就行**：
+
 ```sh
-# /usr/local/bin/dsh-ios
-node --predictable --single-threaded \
-     --wasm-enforce-bounds-checks --wasm-max-mem-pages=16384 \
-     --wasm-max-code-space-size-mb=64 --wasm-max-committed-code-mb=32 \
-     --require /usr/local/lib/fetch-shim.cjs \
-     --expose-internals /usr/local/bin/dsh web
+dsh-ios            # = dsh web --no-open，然后在 Safari 打开 http://127.0.0.1:3080
+dsh <任意子命令>    # 其他 dsh 子命令走同一个 node 参数组合
 ```
+
+`/usr/local/bin/dsh` 会做三件事：
+
+1. 用 `jbroot` 把 node / 入口 / 垫片的路径翻译成**真实路径**（RootHide 的 shell 与 node 看到的
+   文件系统视图不同，不翻译会 ENOENT——真机踩过）；
+2. 默认加 `--jitless`（见下）；
+3. `--require fetch-shim.cjs` + `--expose-internals`。
+
+手写等价命令：
+
+```sh
+node --jitless --predictable --single-threaded --expose-internals \
+     --require "$(jbroot /usr/local/lib/fetch-shim.cjs)" \
+     "$(jbroot /usr/local/lib/node_modules/@deepseek-ai/dsh/lib/bin.js)" web --no-open
+```
+
+**为什么默认 `--jitless`**：作者的 V8 W^X 补丁只在 A14 上验证过；A 系列之外的设备（如 M1 iPad）
+开 JIT 会 SIGBUS。功能不受影响，只是 JS 慢一些。确认自己设备能开 JIT 时用 `DSH_IOS_JIT=1 dsh-ios`
+切回快路径。
 
 ### 推荐启动姿势（其他工具）
 ```sh
@@ -174,9 +213,14 @@ NODE_OPTIONS="--predictable --single-threaded \
 
 ## 当前发布状态
 
-- RootHide 构建产物：`dsh-ios_0.1.1-rc.2-1_iphoneos-arm64e.deb`（基于 `@deepseek-ai/dsh` 0.1.1-rc.2，**内含 koffi 插件 stub**）+ `nodejs_22.23.2-1_iphoneos-arm64e.deb`。此前列出的 JIT、ICU 与 dsh web 设备验证是在 Dopamine rootless 上完成；这些记录不代表 RootHide 真机验证。安装顺序：nodejs → dsh-ios。**deb 产物不进 git（dist/ 已 gitignore）。**
-- 分支 `ios-port` 已推送到 fork [`ddddddedcds/deepseek-harness-ios`](https://github.com/ddddddedcds/deepseek-harness-ios)
-  （原 `deepseek-harness`，已改名）；`master` 已 fast-forward 到上游 0.1.1-rc.2（`b150a551`）。
-- 已知限制：WebAssembly 不可用（stub，见上）；沙箱/FFI 子进程不可用（koffi stub，见上）；
-  sharp/libvips 图片附件不可用（shim）；worker_threads 不可用（--single-threaded）；
-  iOS 16.7 Safari 需 `AbortSignal.any` polyfill（已注入前端 index.html，完整实现含 reason 传播）。
+- 产物：`dsh-ios_0.1.7-rc.2-1_iphoneos-arm64e.deb`（内含 `@deepseek-ai/dsh` 0.1.7-rc.2、node-pty
+  交叉编译产物、`fetch-shim.cjs`、前端 polyfill）+ `nodejs_22.23.2-1_iphoneos-arm64e.deb`。
+  安装顺序：nodejs → dsh-ios。**deb 产物不进 git（dist/ 已 gitignore），由 CI 产出。**
+- 版本号只有一处来源：`scripts/ios/build-dsh-ios.sh` 顶部的 `DSH_VER`；`control` 的 `Version`、
+  deb 文件名、CI 的产物校验都从它推出来。
+- 设备验证覆盖：JIT / ICU / fetch-shim / dsh web 200 / LLM 200 的记录来自
+  **iPhone 12 Pro Max / A14 / iOS 16.7 / Dopamine rootless**；RootHide 上只验证到
+  "插件系统启动 + 垫片生效"，**0.1.7-rc.2 这版还没做完整真机回归**。
+- 已知限制：WebAssembly 不可用（stub）；沙箱隔离与 FFI 子进程不可用；sharp/libvips 图片附件不可用；
+  `worker_threads` 不可用（`--single-threaded`）；JIT 默认关闭（`DSH_IOS_JIT=1` 可开）；
+  iOS 16.7 Safari 的 `AbortSignal.any` 由构建期注入的 polyfill 兜底。

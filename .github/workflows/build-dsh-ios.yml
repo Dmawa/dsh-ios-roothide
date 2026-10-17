@@ -22,7 +22,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: 安装 ninja + ccache
+      - name: 脚本语法检查（先失败先报，别等 2.5 小时）
+        run: |
+          set -e
+          bash -n scripts/ios/build-node-ios.sh
+          bash -n scripts/ios/build-dsh-ios.sh
+          node --check scripts/ios/fetch-shim.cjs
+          python3 -m py_compile scripts/ios/apply_patches.py scripts/ios/inject-web-polyfill.py
+          echo "syntax ok"
+
+      - name: 安装 ninja + ccache + dpkg
         run: brew install ninja ccache dpkg
 
       - name: 缓存 Node 源码与构建产物
@@ -42,24 +51,32 @@ jobs:
           ./scripts/ios/build-node-ios.sh
         timeout-minutes: 360
 
-      - name: 打包 dsh-ios deb（node-pty addon + DSH 全量依赖）
-        run: ./scripts/ios/build-dsh-ios.sh
+      - name: 打包 dsh-ios deb（node-pty addon + DSH 全量依赖 + shims）
+        run: |
+          chmod +x scripts/ios/*.sh
+          ./scripts/ios/build-dsh-ios.sh
         timeout-minutes: 180
+
+      - name: 校验产物
+        run: |
+          set -e
+          ls -l dist/*.deb
+          # 版本号必须与脚本里钉住的 dsh 版本一致，避免再次出现 0.1.1 包里装 0.1.7 的情况
+          DSH_VER=$(sed -n 's/^DSH_VER="${DSH_VER:-\(.*\)}"$/\1/p' scripts/ios/build-dsh-ios.sh)
+          test -n "$DSH_VER"
+          ls "dist/dsh-ios_${DSH_VER}-1_iphoneos-arm64e.deb"
+          echo "dsh version: $DSH_VER"
 
       - name: 上传 deb 产物
         uses: actions/upload-artifact@v4
         with:
           name: dsh-ios-debs
-          path: |
-            dist/nodejs_22.23.2-1_iphoneos-arm64e.deb
-            dist/dsh-ios_0.1.1-rc.2-1_iphoneos-arm64e.deb
+          path: dist/*.deb
           if-no-files-found: error
 
       - name: 发布到 Release（仅 tag 触发时）
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            dist/nodejs_22.23.2-1_iphoneos-arm64e.deb
-            dist/dsh-ios_0.1.1-rc.2-1_iphoneos-arm64e.deb
+          files: dist/*.deb
           generate_release_notes: true

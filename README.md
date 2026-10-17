@@ -38,23 +38,25 @@ pnpm dsh web
 
 ## iOS (jailbroken)
 
-A community port of `dsh` runs on jailbroken iOS (arm64, rootless jailbreaks such as Dopamine). It bundles a cross-compiled Node.js 22 runtime, a native `node-pty` addon, and JS shims for `sharp`/`require-builtin`, packaged as a `.deb`.
+A community port of `dsh` runs on jailbroken iOS (arm64, rootless jailbreaks such as Dopamine and RootHide). It bundles a cross-compiled Node.js 22 runtime, a native `node-pty` addon, and JS shims for `sharp` / `require-builtin` / `fetch`, packaged as a `.deb`.
 
 - Build & packaging guide: [docs/ios-port.md](docs/ios-port.md)
-- Current package: `dsh-ios_0.1.1-rc.2-1_iphoneos-arm64.deb`
+- Project state / handover notes: [docs/HANDOVER.md](docs/HANDOVER.md)
+- Current package: `dsh-ios_0.1.7-rc.2-1_iphoneos-arm64e.deb` (bundles `@deepseek-ai/dsh` 0.1.7-rc.2)
 
-Known limitations: `sharp`/`libvips` are shimmed (no image processing); `node-pty` is built but pending on-device verification; on a device the runtime uses a patched V8 full JIT via `mprotect` W^X (works on A14/arm64e; run with `--predictable --single-threaded`), the bundled Node ships small-icu so Unicode property regexes work; WebAssembly is stubbed via the bundled `fetch-shim.cjs` (undici's wasm llhttp fatals on A14; `fetch` is re-routed through `node:http`); the `dsh-sandbox-local`/`dsh-subprocess-local` plugins are inert stubs (their koffi FFI addon has no iOS prebuilt), which is required for `dsh web` to boot — it serves `http://127.0.0.1:3080` on-device. See [docs/ios-port.md](docs/ios-port.md) for full runtime constraints.
+Install order matters — `nodejs` first, then `dsh-ios` (sign `node` with `ldid` once, see the guide). Then just run `dsh-ios` and open `http://127.0.0.1:3080` in Safari; the launcher handles RootHide's `jbroot` path translation, the `fetch` shim and the JIT flags for you.
+
+Known limitations: `sharp`/`libvips` are shimmed (no image processing); WebAssembly is stubbed and `fetch` is re-routed through `node:http` by the bundled `fetch-shim.cjs` (undici's wasm llhttp is fatal on A14, and the DeepSeek gateway rejects UA-less requests); the runtime defaults to `--jitless` because the patched V8 W^X path is only verified on A14 and SIGBUSes elsewhere (`DSH_IOS_JIT=1` opts back in); sandbox isolation and koffi-based FFI subprocesses are unavailable on iOS (no prebuilt). The bundled Node ships small-icu, so Unicode property regexes work. `worker_threads` is unavailable under `--single-threaded`. See [docs/ios-port.md](docs/ios-port.md) for full runtime constraints.
 
 ### iOS port credits
 
 The iOS port builds on the following public work (idea/recipe lineage, not copied code; full detail in [docs/ios-port.md](docs/ios-port.md)):
 
-- [dddddedcds/Node.js-for-ios](https://github.com/ddddddedcds/Node.js-for-ios) — cross-compile recipe, V8 W^X patch, fetch shim, launcher (standalone repo).
+- `dddddedcds/Node.js-for-ios` (now removed upstream) — cross-compile recipe, V8 W^X patch, fetch shim, launcher. `scripts/ios/fetch-shim.cjs` here is a clean-room rewrite of that shim.
 - [j0shua-SYSON/openclaw-ios](https://github.com/j0shua-SYSON/openclaw-ios) — V8 W^X JIT patch source (MIT).
 - [j0shua-SYSON/node-ios](https://github.com/j0shua-SYSON/node-ios) — Node-iOS build approach & entitlements (MIT).
 - [davghz/node22-ios-source](https://github.com/davghz/node22-ios-source) — Node 22 iOS cross-compile recipe.
 - [imcynic/nodejs-ios](https://github.com/imcynic/nodejs-ios) — no-MAP_JIT path evidence (no independent LICENSE; idea reference only).
-
 ## Community and support
 
 - Feel free to submit feedback or bug reports through [GitHub Discussions](https://github.com/deepseek-ai/deepseek-harness/discussions).

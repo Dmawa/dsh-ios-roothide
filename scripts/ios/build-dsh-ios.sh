@@ -1,32 +1,44 @@
 #!/bin/sh
-# build-dsh-ios.sh — bundle DeepSeek Harness for iOS:
+# build-dsh-ios.sh — bundle DeepSeek Harness for jailbroken iOS:
 #   * cross-compile node-pty addon (pty.node + spawn-helper, arm64 iOS)
 #   * npm-install @deepseek-ai/dsh (scripts disabled)
-#   * apply JS shims (sharp / require-builtin)
+#   * apply JS shims (sharp / require-builtin / fetch / web polyfills)
 #   * package dsh-ios .deb (self-contained, no device-side npm)
 #
-# Usage: ./scripts/build-dsh-ios.sh   (requires nodejs deb built first: scripts/build-node-ios.sh)
-# Output: dist/dsh-ios_0.1.1-rc.2-1_iphoneos-arm64e.deb
+# Usage: ./scripts/ios/build-dsh-ios.sh   (requires nodejs deb built first: scripts/ios/build-node-ios.sh)
+# Output: dist/dsh-ios_${DSH_VER}-${DEB_REV}_${DEB_ARCH}.deb
+#
+# Env:
+#   DSH_VER                 @deepseek-ai/dsh version to bundle (default below)
+#   DSH_IOS_STUB_PLUGINS=1  replace dsh-sandbox-local / dsh-subprocess-local with
+#                           inert stubs (only needed if koffi blocks boot again;
+#                           0.1.7 lazy-requires koffi, so this is off by default)
 set -e
 
-ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$ROOT"
 mkdir -p dist
+
+NODE_VER=22.23.2
+DSH_VER="${DSH_VER:-0.1.7-rc.2}"
+DEB_REV=1
+DEB_VER="${DSH_VER}-${DEB_REV}"
+DEB_ARCH=iphoneos-arm64e
+SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+SHIM="$ROOT/ios-sdk-shim"
 WORK=/tmp/dsh-ios-work
 rm -rf "$WORK"
 mkdir -p "$WORK"
 
-NODE_VER=22.23.2
-DEB_ARCH=iphoneos-arm64e
-SDK=$(xcrun --sdk iphoneos --show-sdk-path)
-SHIM="$ROOT/ios-sdk-shim"
+echo "== [0/6] 目标版本: @deepseek-ai/dsh@$DSH_VER (deb $DEB_VER) =="
 
-echo "== [1/5] 下载 node headers（node-pty 编译用）=="
+echo "== [1/6] 下载 node headers（node-pty 编译用）=="
 curl -sL -o /tmp/node-hdrs.tar.gz "https://nodejs.org/download/release/v$NODE_VER/node-v$NODE_VER-headers.tar.gz"
 tar xzf /tmp/node-hdrs.tar.gz -C "$WORK"
 mv "$WORK/node-v$NODE_VER" "$WORK/node-headers"
 
-echo "== [2/5] 交叉编译 node-pty =="
+echo "== [2/6] 交叉编译 node-pty =="
 mkdir -p "$WORK/node-pty" && cd "$WORK/node-pty"
 npm pack node-pty@1.1.0 --silent >/dev/null
 tar xzf node-pty-1.1.0.tgz && mv package node-pty-src && cd node-pty-src
@@ -124,20 +136,23 @@ npx --yes node-gyp@10 rebuild --nodedir="$WORK/node-headers" --arch=arm64 >"$WOR
   echo "node-pty 编译失败，详见 $WORK/node-pty-build.log:"; tail -40 "$WORK/node-pty-build.log"; exit 1; }
 ls build/Release/pty.node build/Release/spawn-helper >/dev/null 2>&1 || { echo "node-pty 产物缺失"; exit 1; }
 
-echo "== [3/5] npm 安装 @deepseek-ai/dsh（跳过原生构建）=="
+echo "== [3/6] npm 安装 @deepseek-ai/dsh@$DSH_VER（跳过原生构建）=="
 mkdir -p "$WORK/dsh" && cd "$WORK/dsh"
 npm init -y >/dev/null 2>&1
 npm_config_ignore_scripts=true npm_config_fund=false npm_config_audit=false \
-  npm install @deepseek-ai/dsh@0.1.7-rc.2 --no-audit --no-fund --silent >/dev/null 2>&1
+  npm install "@deepseek-ai/dsh@$DSH_VER" --no-audit --no-fund >"$WORK/npm-install.log" 2>&1 || {
+  echo "npm install 失败，详见 $WORK/npm-install.log:"; tail -40 "$WORK/npm-install.log"; exit 1; }
 
-echo "== [4/5] 应用 iOS addon + shims =="
+echo "== [4/6] 应用 iOS addon + shims =="
 NM="$WORK/dsh/node_modules"
 mkdir -p "$NM/node-pty/build/Release"
 cp "$WORK/node-pty/node-pty-src/build/Release/pty.node" "$NM/node-pty/build/Release/"
 cp "$WORK/node-pty/node-pty-src/build/Release/spawn-helper" "$NM/node-pty/build/Release/"
 chmod 755 "$NM/node-pty/build/Release/spawn-helper"
 rm -rf "$NM/node-pty/prebuilds" "$NM/@img"
-# sharp 双入口 shim（exports 把 ESM import 路由到 index.mjs）
+
+# sharp: libvips 无法在 iOS 编译 -> 双入口 shim（exports 把 ESM import 路由到 index.mjs）
+if [ -d "$NM/sharp" ]; then
 cat > "$NM/sharp/dist/index.cjs" <<'EOF'
 "use strict";
 function u(){throw new Error("sharp is not available on this iOS build: image attachment processing is disabled");}
@@ -149,6 +164,10 @@ function u(){throw new Error("sharp is not available on this iOS build: image at
 u.format={};u.versions={sharp:"0.0.0-ios-shim"};u.simd=false;u.concurrency=1;u.cache=()=>u;u.cacheable=true;
 export default u;
 EOF
+fi
+
+# node-addon-require-builtin: 依赖 V8 内部绑定，iOS 上改用普通 require
+if [ -d "$NM/node-addon-require-builtin" ]; then
 cat > "$NM/node-addon-require-builtin/lib/index.js" <<'EOF'
 "use strict";
 function requireBuiltin(id){return require(id);}
@@ -157,38 +176,133 @@ function getBindingInfo(){return {native:false,addon:null};}
 exports.requireBuiltin=requireBuiltin;exports.isAllowedInternalId=isAllowedInternalId;exports.getBindingInfo=getBindingInfo;
 exports.default={requireBuiltin,isAllowedInternalId,getBindingInfo};
 EOF
+fi
 
-echo "== [5/5] 打包 dsh-ios deb =="
+# 可选：koffi 硬 import 挡启动时，把两个本地 provider 换成惰性 stub。
+# 0.1.7 起 koffi 已是 createLazyRequire 惰性加载，默认不需要。
+if [ "${DSH_IOS_STUB_PLUGINS:-0}" = "1" ]; then
+  echo "  DSH_IOS_STUB_PLUGINS=1 -> 应用 sandbox/subprocess 惰性 stub"
+  if [ -d "$NM/@deepseek-ai/dsh-sandbox-local/lib" ]; then
+cat > "$NM/@deepseek-ai/dsh-sandbox-local/lib/index.js" <<'EOF'
+import { SandboxProvider } from "@deepseek-ai/dsh-sandbox";
+export default class LocalSandboxProvider extends SandboxProvider {
+  async start() {}
+}
+EOF
+  fi
+  if [ -d "$NM/@deepseek-ai/dsh-subprocess-local/lib" ]; then
+cat > "$NM/@deepseek-ai/dsh-subprocess-local/lib/index.js" <<'EOF'
+import { SubprocessRuntime } from "@deepseek-ai/dsh-subprocess";
+export default class LocalSubprocessRuntime extends SubprocessRuntime {
+  async start() {}
+}
+EOF
+  fi
+fi
+
+# 前端 polyfill（iOS 16.7 Safari 缺 AbortSignal.any）
+python3 "$SCRIPT_DIR/inject-web-polyfill.py" "$NM"
+
+echo "== [5/6] 组装 deb 目录 =="
 DEB=/tmp/dsh-deb
 rm -rf "$DEB" && mkdir -p "$DEB/DEBIAN" "$DEB/usr/local/bin" "$DEB/usr/local/lib"
 cp -a "$NM" "$DEB/usr/local/lib/node_modules"
-ln -s ../lib/node_modules/@deepseek-ai/dsh/lib/bin.js "$DEB/usr/local/bin/dsh"
+cp "$SCRIPT_DIR/fetch-shim.cjs" "$DEB/usr/local/lib/fetch-shim.cjs"
+chmod 644 "$DEB/usr/local/lib/fetch-shim.cjs"
+
+# 所有入口都走同一套 node 参数。
+#
+# RootHide 的文件系统是虚拟化的：shell 看到的是 jbroot 合并后的视图，而 node
+# 看到的是真实路径。所以交给 node 的每一个路径都必须先过 `jbroot` 翻译，否则
+# --require / 入口脚本都会 ENOENT（真机实测过）。
+#
+# --jitless 是默认值：移植作者的 V8 W^X 补丁只在 A14 上验证过，A 系列之外的
+# 设备（如 M1 iPad）开 JIT 会 SIGBUS。功能不受影响，只是 JS 慢一些。
+# 想赌一把 JIT 就 DSH_IOS_JIT=1 dsh-ios。
+cat > "$DEB/usr/local/bin/dsh" <<'EOF'
+#!/bin/sh
+# dsh — DeepSeek Harness on jailbroken iOS (RootHide / rootless aware)
+
+jb() {
+  if command -v jbroot >/dev/null 2>&1; then
+    jbroot "$1"
+  elif [ -n "${JBROOT:-}" ] && [ -e "${JBROOT}$1" ]; then
+    printf '%s\n' "${JBROOT}$1"
+  else
+    printf '%s\n' "$1"
+  fi
+}
+
+NODE=$(jb /usr/local/bin/node)
+ENTRY=$(jb /usr/local/lib/node_modules/@deepseek-ai/dsh/lib/bin.js)
+SHIM=$(jb /usr/local/lib/fetch-shim.cjs)
+
+if [ ! -x "$NODE" ]; then
+  echo "dsh: node not found at $NODE (install the nodejs package first)" >&2
+  exit 127
+fi
+if [ ! -f "$SHIM" ]; then
+  echo "dsh: fetch-shim missing at $SHIM (broken install?)" >&2
+  exit 127
+fi
+
+export DSH_HOME="${DSH_HOME:-${HOME:-/var/mobile}/.dsh}"
+export PATH="$(dirname "$NODE"):$PATH"
+
+# --predictable --single-threaded: required by the patched V8 W^X path.
+FLAGS="--predictable --single-threaded"
+if [ "${DSH_IOS_JIT:-0}" != "1" ]; then
+  FLAGS="--jitless $FLAGS"
+fi
+
+exec "$NODE" $FLAGS --expose-internals --require "$SHIM" "$ENTRY" "$@"
+EOF
+chmod 755 "$DEB/usr/local/bin/dsh"
+
 cat > "$DEB/usr/local/bin/dsh-ios" <<'EOF'
 #!/bin/sh
-export DSH_HOME="${DSH_HOME:-${HOME:-/rootfs/var/mobile}/.dsh}"
-export PATH="/usr/local/bin:$PATH"
-# --predictable --single-threaded: required on iOS. Without them the V8 W^X
-# page-flip races with JIT and crashes with SIGBUS (see docs/ios-port.md).
-exec /usr/local/bin/node --expose-internals --predictable --single-threaded /usr/local/bin/dsh web "$@"
+# dsh-ios — 启动 Web UI（不自动开浏览器），然后用 Safari 打开 http://127.0.0.1:3080
+exec /usr/local/bin/dsh web --no-open "$@"
 EOF
 chmod 755 "$DEB/usr/local/bin/dsh-ios"
-cat > "$DEB/DEBIAN/control" <<'CTRL'
+cat > "$DEB/DEBIAN/control" <<CTRL
 Package: dsh-ios
 Name: DeepSeek Harness for iOS
-Version: 0.1.1-rc.2-1
-Architecture: iphoneos-arm64e
+Version: $DEB_VER
+Architecture: $DEB_ARCH
 Maintainer: dsh-ios port
 Section: Development
 Depends: nodejs (>= 22.19.0)
-Description: DeepSeek Harness (dsh) for jailbroken iOS. Bundles the full CLI with cross-compiled node-pty (real PTY) and JS shims for sharp / require-builtin. Self-contained: no npm needed on the device. Launch with "dsh-ios".
+Description: DeepSeek Harness (dsh) for jailbroken iOS. Bundles the full CLI with cross-compiled node-pty (real PTY) and JS shims for sharp / require-builtin / fetch. Self-contained: no npm needed on the device. Launch with "dsh-ios".
 CTRL
+
 cat > "$DEB/DEBIAN/postinst" <<'CTRL'
 #!/bin/sh
+# dsh-ios postinst
+#  - sign the cross-compiled node-pty addons so AMFI will load them
+#  - register them in the trust cache (RootHide: jbctl lives under $JBROOT/basebin)
 P=/usr/local
 REL="$P/lib/node_modules/node-pty/build/Release"
 LOG=/rootfs/var/mobile/.dsh/postinst.log
 mkdir -p "$(dirname "$LOG")" 2>/dev/null
 log(){ echo "[dsh-ios postinst $(date +%H:%M:%S)] $*" >> "$LOG" 2>/dev/null; }
+
+# RootHide keeps ldid/jbctl outside the default PATH.
+if command -v jbroot >/dev/null 2>&1; then
+  for d in basebin usr/bin usr/local/bin; do
+    p=$(jbroot "/$d" 2>/dev/null) || continue
+    [ -d "$p" ] && PATH="$p:$PATH"
+  done
+fi
+for d in /var/jb/basebin /var/jb/usr/bin; do
+  [ -d "$d" ] && PATH="$d:$PATH"
+done
+export PATH
+
+if [ ! -f "$P/lib/fetch-shim.cjs" ]; then
+  log "WARN: /usr/local/lib/fetch-shim.cjs missing - dsh will not start"
+fi
+
 if command -v ldid >/dev/null 2>&1; then
   for f in "$REL/pty.node" "$REL/spawn-helper"; do
     [ -f "$f" ] || continue
@@ -200,6 +314,7 @@ else
   log "ERROR: ldid not found"
   exit 1
 fi
+
 # trustcache: AMFI needs the addons registered or they SIGKILL on load.
 if command -v jbctl >/dev/null 2>&1; then
   for f in "$REL/pty.node" "$REL/spawn-helper"; do
@@ -209,8 +324,24 @@ if command -v jbctl >/dev/null 2>&1; then
 else
   log "WARN: jbctl not found - trustcache registration skipped"
 fi
+
+echo "dsh-ios installed. Run 'dsh-ios' and open http://127.0.0.1:3080 in Safari."
 exit 0
 CTRL
 chmod 755 "$DEB/DEBIAN/postinst"
-dpkg-deb -b --root-owner-group -Zgzip "$DEB" "$ROOT/dist/dsh-ios_0.1.1-rc.2-1_${DEB_ARCH}.deb" >/dev/null
-echo "✅ $ROOT/dist/dsh-ios_0.1.1-rc.2-1_${DEB_ARCH}.deb"
+
+echo "== [6/6] 打包前自检 =="
+fail=0
+check(){ if [ -e "$1" ]; then echo "  ok   $2"; else echo "  MISS $2"; fail=1; fi; }
+check "$DEB/usr/local/lib/fetch-shim.cjs" "fetch-shim.cjs"
+check "$DEB/usr/local/bin/dsh-ios" "launcher dsh-ios"
+check "$DEB/usr/local/lib/node_modules/@deepseek-ai/dsh/lib/bin.js" "dsh entry"
+check "$DEB/usr/local/lib/node_modules/node-pty/build/Release/pty.node" "node-pty addon"
+grep -q 'dsh-ios-polyfill' "$DEB/usr/local/lib/node_modules/@deepseek-ai/dsh-web-frontend/dist/index.html" \
+  && echo "  ok   web polyfill" || { echo "  MISS web polyfill"; fail=1; }
+grep -q 'fetch-shim.cjs' "$DEB/usr/local/bin/dsh" \
+  && echo "  ok   launcher requires fetch-shim" || { echo "  MISS launcher fetch-shim wiring"; fail=1; }
+if [ "$fail" != "0" ]; then echo "打包自检失败"; exit 1; fi
+
+dpkg-deb -b --root-owner-group -Zgzip "$DEB" "$ROOT/dist/dsh-ios_${DEB_VER}_${DEB_ARCH}.deb" >/dev/null
+echo "✅ $ROOT/dist/dsh-ios_${DEB_VER}_${DEB_ARCH}.deb"
