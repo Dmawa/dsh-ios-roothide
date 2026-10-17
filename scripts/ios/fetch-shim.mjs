@@ -18,12 +18,14 @@
  *     "ReferenceError: WebAssembly is not defined".
  *
  * Conclusion: undici must never be loaded. That means we cannot keep the native
- * Request/Response/Headers classes (they are undici's, and merely reading them
- * triggers the load). This module therefore defines ALL FOUR globals itself,
- * before Node's lazy getters can fire, using a pure node:http implementation.
+ * Request/Response/Headers classes (they are undici's; merely reading them
+ * triggers the load). This module defines ALL FOUR globals itself, in an ESM
+ * preload (--import runs before Node's internal modules are reachable), so the
+ * lazy getters never fire.
  *
- * Loaded with --import (not --require): an ESM preload runs before Node's
- * internal modules are reachable. --require is too late and too weak here.
+ * Bodies are streamed, not buffered: dsh consumes the DeepSeek chat API as
+ * Server-Sent Events, which never end. Buffering the whole response before
+ * returning would hang forever.
  */
 
 import http from "node:http";
@@ -65,11 +67,10 @@ if (process.env.DSH_IOS_KEEP_WASM !== "1") {
 }
 
 // ---------------------------------------------------------------------------
-// Minimal Headers / Request / Response, implemented without undici
+// Headers
 // ---------------------------------------------------------------------------
 class Headers {
   #map = new Map();
-
   constructor(init) {
     if (!init) return;
     if (init instanceof Headers) {
@@ -77,14 +78,13 @@ class Headers {
       return;
     }
     if (Array.isArray(init)) {
-      for (const [k, v] of init) this.append(k, v);
+      for (const pair of init) this.append(pair[0], pair[1]);
       return;
     }
     if (typeof init === "object") {
       for (const k of Object.keys(init)) this.append(k, init[k]);
     }
   }
-
   append(name, value) {
     const key = String(name).toLowerCase();
     const cur = this.#map.get(key);
@@ -97,9 +97,9 @@ class Headers {
   }
   has(name) { return this.#map.has(String(name).toLowerCase()); }
   delete(name) { this.#map.delete(String(name).toLowerCase()); }
-  *entries() { for (const [k, v] of this.#map) yield [k, v]; }
-  *keys() { for (const k of this.#map.keys()) yield k; }
-  *values() { for (const v of this.#map.values()) yield v; }
+  *entries() { for (const pair of this.#map) yield pair; }
+  *keys() { yield* this.#map.keys(); }
+  *values() { yield* this.#map.values(); }
   [Symbol.iterator]() { return this.entries(); }
   forEach(cb, thisArg) {
     for (const [k, v] of this.#map) cb.call(thisArg, v, k, this);
@@ -111,19 +111,72 @@ class Headers {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Request
+// ---------------------------------------------------------------------------
 class Request {
   constructor(input, init = {}) {
-    const url = String(input instanceof Request ? input.url : input);
+    const raw = String(input instanceof Request ? input.url : input);
     try {
-      this.url = new URL(url).href;
+      this.url = new URL(raw).href;
     } catch {
-      this.url = new URL(url, FETCH_BASE).href;
+      this.url = new URL(raw, FETCH_BASE).href;
     }
     this.method = String(init.method || (input instanceof Request ? input.method : "GET")).toUpperCase();
     this.headers = new Headers(init.headers || (input instanceof Request ? input.headers : undefined));
     this.signal = init.signal || (input instanceof Request ? input.signal : undefined) || null;
     this.body = init.body !== undefined ? init.body : input instanceof Request ? input.body : null;
   }
+}
+
+// ---------------------------------------------------------------------------
+// Response — body is a real ReadableStream (SSE-safe), never pre-buffered
+// ---------------------------------------------------------------------------
+function streamFromNode(res) {
+  let onData;
+  let onEnd;
+  let onError;
+  return new ReadableStream({
+    start(controller) {
+      onData = (chunk) => {
+        try {
+          controller.enqueue(new Uint8Array(chunk));
+        } catch {
+          res.destroy();
+        }
+      };
+      onEnd = () => {
+        try {
+          controller.close();
+        } catch {
+          /* already closed */
+        }
+      };
+      onError = (err) => {
+        try {
+          controller.error(err);
+        } catch {
+          /* already errored */
+        }
+      };
+      res.on("data", onData);
+      res.on("end", onEnd);
+      res.on("error", onError);
+      res.on("aborted", () => onError(new Error("response aborted")));
+    },
+    cancel() {
+      res.destroy();
+    },
+  });
+}
+
+function bytesToStream(bytes) {
+  return new ReadableStream({
+    start(controller) {
+      if (bytes && bytes.length) controller.enqueue(new Uint8Array(bytes));
+      controller.close();
+    },
+  });
 }
 
 class Response {
@@ -135,47 +188,59 @@ class Response {
     this.redirected = Boolean(init.redirected);
     this.ok = this.status >= 200 && this.status < 300;
     this.bodyUsed = false;
+    this.type = "default";
 
     if (body === null || body === undefined) {
-      this.#bytes = Buffer.alloc(0);
+      this.#source = { kind: "bytes", bytes: Buffer.alloc(0) };
+    } else if (typeof body.getReader === "function") {
+      this.#source = { kind: "stream", stream: body };
     } else if (typeof body === "string") {
-      this.#bytes = Buffer.from(body);
+      this.#source = { kind: "bytes", bytes: Buffer.from(body) };
     } else if (Buffer.isBuffer(body)) {
-      this.#bytes = body;
+      this.#source = { kind: "bytes", bytes: body };
     } else if (typeof body.arrayBuffer === "function") {
-      this.#bytes = Buffer.from(body);
+      this.#source = { kind: "bytes", bytes: Buffer.from(body) };
     } else {
-      this.#bytes = Buffer.from(String(body));
+      this.#source = { kind: "bytes", bytes: Buffer.from(String(body)) };
     }
-    this.body = null;
   }
 
-  #bytes = Buffer.alloc(0);
+  #source;
 
-  _stream() {
-    const bytes = this.#bytes;
-    let done = false;
-    return new ReadableStream({
-      start(controller) {
-        if (bytes.length) controller.enqueue(new Uint8Array(bytes));
-        controller.close();
-        done = true;
-      },
-      cancel() { done = true; },
-    });
+  get body() {
+    if (this.bodyUsed) return null;
+    this.bodyUsed = true;
+    if (this.#source.kind === "stream") return this.#source.stream;
+    return bytesToStream(this.#source.bytes);
+  }
+
+  async #collect() {
+    if (this.#source.kind === "bytes") return this.#source.bytes;
+    const reader = this.#source.stream.getReader();
+    const chunks = [];
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(Buffer.from(value));
+    }
+    return Buffer.concat(chunks);
   }
 
   async arrayBuffer() {
-    this.bodyUsed = true;
-    return this.#bytes.buffer.slice(
-      this.#bytes.byteOffset,
-      this.#bytes.byteOffset + this.#bytes.byteLength
-    );
+    const bytes = await this.#collect();
+    return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
   }
-  async text() { this.bodyUsed = true; return this.#bytes.toString("utf8"); }
-  async json() { this.bodyUsed = true; return JSON.parse(this.#bytes.toString("utf8")); }
+  async text() {
+    return (await this.#collect()).toString("utf8");
+  }
+  async json() {
+    return JSON.parse(await this.text());
+  }
   clone() {
-    return new Response(Buffer.from(this.#bytes), {
+    if (this.#source.kind !== "bytes") {
+      throw new Error("Response.clone() is not supported for streamed bodies");
+    }
+    return new Response(Buffer.from(this.#source.bytes), {
       status: this.status,
       statusText: this.statusText,
       headers: this.headers,
@@ -183,28 +248,28 @@ class Response {
       redirected: this.redirected,
     });
   }
-  static error() { return new Response(null, { status: 0, statusText: "" }); }
+  static error() {
+    return new Response(null, { status: 0, statusText: "" });
+  }
   static json(data, init = {}) {
-    const r = new Response(JSON.stringify(data), init);
-    if (!r.headers.has("content-type")) r.headers.set("content-type", "application/json");
-    return r;
+    const res = new Response(JSON.stringify(data), init);
+    if (!res.headers.has("content-type")) {
+      res.headers.set("content-type", "application/json");
+    }
+    return res;
   }
 }
 
-function bodyToBuffer(body) {
+// ---------------------------------------------------------------------------
+// fetch
+// ---------------------------------------------------------------------------
+async function toBuffer(body) {
   if (body === null || body === undefined) return null;
   if (typeof body === "string") return Buffer.from(body);
   if (Buffer.isBuffer(body)) return body;
   if (body instanceof ArrayBuffer) return Buffer.from(body);
   if (ArrayBuffer.isView(body)) return Buffer.from(body.buffer, body.byteOffset, body.byteLength);
-  if (typeof body.arrayBuffer === "function") return Buffer.from(body);
-  return Buffer.from(String(body));
-}
-
-async function toBuffer(body) {
-  const direct = bodyToBuffer(body);
-  if (direct) return direct;
-  if (body && typeof body.getReader === "function") {
+  if (typeof body.getReader === "function") {
     const reader = body.getReader();
     const chunks = [];
     for (;;) {
@@ -214,9 +279,19 @@ async function toBuffer(body) {
     }
     return Buffer.concat(chunks);
   }
-  return null;
+  return Buffer.from(String(body));
 }
 
+function abortError(reason) {
+  if (reason instanceof Error) return reason;
+  const err = new Error("The operation was aborted.");
+  err.name = "AbortError";
+  if (reason !== undefined) err.cause = reason;
+  return err;
+}
+
+// Resolves as soon as response headers arrive; the body stays readable as a
+// stream (required for SSE, which never ends).
 function requestOnce(url, method, headers, bodyBuffer, signal) {
   return new Promise((resolve, reject) => {
     const mod = url.protocol === "https:" ? https : http;
@@ -228,19 +303,21 @@ function requestOnce(url, method, headers, bodyBuffer, signal) {
     const fail = (err) => {
       if (settled) return;
       settled = true;
-      reject(signal && signal.aborted
-        ? Object.assign(new Error("The operation was aborted."), { name: "AbortError" })
-        : err);
+      reject(signal && signal.aborted ? abortError(signal.reason) : err);
     };
 
     const req = mod.request(url, options, (res) => {
-      if (settled) { res.destroy(); return; }
+      if (settled) {
+        res.destroy();
+        return;
+      }
       settled = true;
-      const chunks = [];
-      res.on("data", (c) => chunks.push(c));
-      res.on("end", () => resolve({ res, bytes: Buffer.concat(chunks) }));
-      res.on("error", fail);
-      res.on("aborted", () => fail(new Error("response aborted")));
+      if (signal && signal.aborted) {
+        res.destroy();
+        reject(abortError(signal.reason));
+        return;
+      }
+      resolve(res);
     });
 
     req.on("error", fail);
@@ -249,33 +326,48 @@ function requestOnce(url, method, headers, bodyBuffer, signal) {
   });
 }
 
+function headersFromNode(res) {
+  const out = new Headers();
+  for (const name of Object.keys(res.headers || {})) {
+    const value = res.headers[name];
+    if (value === undefined) continue;
+    if (Array.isArray(value)) {
+      for (const item of value) out.append(name, item);
+    } else {
+      out.append(name, value);
+    }
+  }
+  return out;
+}
+
 async function iosFetch(input, init) {
   const options = init || {};
-  const req = input instanceof Request ? input : new Request(input, options);
+  const request = input instanceof Request ? input : new Request(input, options);
 
-  if (!req.headers.has("user-agent")) req.headers.set("user-agent", DEFAULT_UA);
-  if (!req.headers.has("accept")) req.headers.set("accept", "*/*");
+  if (!request.headers.has("user-agent")) request.headers.set("user-agent", DEFAULT_UA);
+  if (!request.headers.has("accept")) request.headers.set("accept", "*/*");
 
-  let bodyBuffer = await toBuffer(req.body);
-  if (bodyBuffer && !req.headers.has("content-type")) {
-    req.headers.set("content-type", "text/plain;charset=UTF-8");
+  let bodyBuffer = await toBuffer(request.body);
+  if (bodyBuffer && !request.headers.has("content-type")) {
+    request.headers.set("content-type", "text/plain;charset=UTF-8");
   }
 
-  if (req.signal && req.signal.aborted) {
-    throw Object.assign(new Error("The operation was aborted."), { name: "AbortError" });
+  if (request.signal && request.signal.aborted) {
+    throw abortError(request.signal.reason);
   }
 
-  let currentURL = new URL(req.url);
-  let method = req.method;
+  let currentURL = new URL(request.url);
+  let method = request.method;
   let redirects = 0;
-  const headers = req.headers;
+  const headers = request.headers;
 
   for (;;) {
-    const { res, bytes } = await requestOnce(currentURL, method, headers.raw(), bodyBuffer, req.signal);
+    const res = await requestOnce(currentURL, method, headers.raw(), bodyBuffer, request.signal);
     const status = res.statusCode || 0;
 
     if (status >= 300 && status < 400 && res.headers.location && redirects < MAX_REDIRECTS) {
       redirects += 1;
+      res.resume(); // drain the redirect body
       currentURL = new URL(res.headers.location, currentURL);
       if (status === 303 || ((status === 301 || status === 302) && method === "POST")) {
         method = "GET";
@@ -286,18 +378,10 @@ async function iosFetch(input, init) {
       continue;
     }
 
-    const responseHeaders = new Headers();
-    for (const name of Object.keys(res.headers || {})) {
-      const value = res.headers[name];
-      if (value === undefined) continue;
-      if (Array.isArray(value)) for (const item of value) responseHeaders.append(name, item);
-      else responseHeaders.append(name, value);
-    }
-
-    return new Response(bytes, {
+    return new Response(streamFromNode(res), {
       status,
       statusText: res.statusMessage || "",
-      headers: responseHeaders,
+      headers: headersFromNode(res),
       url: currentURL.href,
       redirected: redirects > 0,
     });
@@ -306,9 +390,8 @@ async function iosFetch(input, init) {
 
 // ---------------------------------------------------------------------------
 // Take over the globals BEFORE Node's lazy undici getters can fire.
-// defineProperty bypasses the getter (plain assignment would invoke it).
 // ---------------------------------------------------------------------------
-const define = (name, value) => {
+function define(name, value) {
   try {
     Object.defineProperty(globalThis, name, {
       value, writable: true, configurable: true, enumerable: false,
@@ -316,7 +399,7 @@ const define = (name, value) => {
   } catch {
     globalThis[name] = value;
   }
-};
+}
 
 define("Headers", Headers);
 define("Request", Request);
