@@ -81,6 +81,16 @@ after(async () => {
   await new Promise((resolve) => server.close(resolve));
 });
 
+// Regression: under --jitless Node does not define globalThis.WebAssembly at
+// all. A guard of the form "only stub if WebAssembly already exists" therefore
+// skips the stub, and undici's llhttp then throws
+// `ReferenceError: WebAssembly is not defined` while loading. The stub must be
+// installed unconditionally.
+test("WebAssembly is defined even when the engine lacks it (--jitless)", () => {
+  assert.equal(typeof globalThis.WebAssembly, "object");
+  assert.equal(typeof globalThis.WebAssembly.compile, "function");
+});
+
 test("WebAssembly is stubbed and never settles", async () => {
   assert.equal(typeof globalThis.WebAssembly.compile, "function");
   const pending = globalThis.WebAssembly.compile(new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0]));

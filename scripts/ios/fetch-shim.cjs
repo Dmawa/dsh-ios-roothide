@@ -58,7 +58,12 @@ function wasmUnavailable() {
   throw new Error("WebAssembly is not available on this iOS build (see fetch-shim.cjs)");
 }
 
-if (process.env.DSH_IOS_KEEP_WASM !== "1" && typeof globalThis.WebAssembly === "object" && globalThis.WebAssembly) {
+// NOTE: the guard MUST NOT be "only stub if WebAssembly already exists".
+// Under --jitless (our default launcher flag) Node does not define
+// globalThis.WebAssembly at all, so such a guard silently skips the stub and
+// undici's llhttp then dies with `ReferenceError: WebAssembly is not defined`
+// during module load. Always install the stub unless explicitly opted out.
+if (process.env.DSH_IOS_KEEP_WASM !== "1") {
   const stub = {
     compile: neverSettles,
     compileStreaming: neverSettles,
