@@ -44,7 +44,7 @@ A community port of `dsh` runs on jailbroken iOS (arm64, rootless jailbreaks suc
 - Project state / handover notes: [docs/HANDOVER.md](docs/HANDOVER.md)
 - Current package: `dsh-ios_0.1.7-rc.2-1_iphoneos-arm64e.deb` (bundles `@deepseek-ai/dsh` 0.1.7-rc.2)
 
-Install order matters — `nodejs` first, then `dsh-ios` (sign `node` with `ldid` once, see the guide). Then just run `dsh-ios` and open `http://127.0.0.1:3080` in Safari; the launcher handles RootHide's `jbroot` path translation, the `fetch` shim and the JIT flags for you.
+Install order matters — `nodejs` first, then `dsh-ios`. Nothing else: both packages sign themselves and register in the trust cache from their postinst, so there are no `ldid`/`jbctl` commands to run. Then just run `dsh-ios` and open `http://127.0.0.1:3080` in Safari; the launcher handles RootHide's `jbroot` path translation, the `fetch` shim and the JIT flags for you.
 
 Known limitations: `sharp`/`libvips` are shimmed (no image processing); WebAssembly is stubbed and `fetch` is re-routed through `node:http` by the bundled `fetch-shim.cjs` (undici's wasm llhttp is fatal on A14, and the DeepSeek gateway rejects UA-less requests); the runtime defaults to `--jitless` because the patched V8 W^X path is only verified on A14 and SIGBUSes elsewhere (`DSH_IOS_JIT=1` opts back in); sandbox isolation and koffi-based FFI subprocesses are unavailable on iOS (no prebuilt). The bundled Node ships small-icu, so Unicode property regexes work. `worker_threads` is unavailable under `--single-threaded`. See [docs/ios-port.md](docs/ios-port.md) for full runtime constraints.
 

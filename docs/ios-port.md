@@ -27,20 +27,22 @@ RootHide 包在 deb 内直接使用 `/usr/local/...` 布局，由 RootHide 的�
 ## 安装（设备端，root）
 
 ```sh
-# 1. 装包（顺序不能反，dsh-ios 依赖 nodejs）
 dpkg -i nodejs_22.23.2-1_iphoneos-arm64e.deb
 dpkg -i dsh-ios_0.1.7-rc.2-1_iphoneos-arm64e.deb
-
-# 2. 给 node 本体签名 + 进 trustcache（只需一次；nodejs 包不含这一步）
-sudo ldid -M -S /usr/local/lib/nodejs/entitlements.plist /usr/local/bin/node
-sudo "$(jbroot /basebin/jbctl)" trustcache add "$(jbroot /usr/local/bin/node)"
-
-# 3. 启动
 dsh-ios          # 然后 Safari 打开 http://127.0.0.1:3080
 ```
 
-`fetch-shim.cjs`、前端 polyfill、node-pty 的签名与 trustcache 都已由包内 postinst 自动处理，
-**不需要再手工下发任何文件**。
+或者在 Sileo 里点两下装完，终端里敲 `dsh-ios` 即可。
+
+**没有手工步骤**：
+
+- `node` 的 `ldid` 签名与 `jbctl trustcache add` 由 nodejs 包的 postinst 完成；
+  dsh-ios 的 postinst 还会兜底再签一次（老版本 nodejs 包/路径问题都能救回来）。
+- `node-pty` 的 `pty.node` / `spawn-helper` 由 dsh-ios 的 postinst 签名 + 加 trustcache。
+- `fetch-shim.cjs`、前端 polyfill 都在包里，launcher 自动 `--require`。
+
+postinst 会先把 `${jbroot}/basebin`、`${jbroot}/usr/bin` 加进 PATH，否则 RootHide 上根本找不到
+`ldid`/`jbctl`——这正是以前需要手工敲那两条命令的原因。
 
 ## 关键设计决策
 

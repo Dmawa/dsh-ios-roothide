@@ -316,6 +316,19 @@ for d in /var/jb/basebin /var/jb/usr/bin; do
 done
 export PATH
 
+# Belt and braces: dsh-ios is always installed after nodejs, and it needs a node
+# that is signed with the JIT entitlements and present in the trust cache. If the
+# nodejs package's own postinst could not do it (older install, or ldid missing
+# from its PATH), fix it here so the user never has to run ldid by hand.
+if [ -f "$P/bin/node" ] && command -v ldid >/dev/null 2>&1; then
+  ldid -M -S"$P/lib/nodejs/entitlements.plist" "$P/bin/node" >>"$LOG" 2>&1 \
+    && log "re-signed node with JIT entitlements" \
+    || log "WARN: re-signing node failed"
+  if command -v jbctl >/dev/null 2>&1; then
+    jbctl trustcache add "$P/bin/node" >>"$LOG" 2>&1 || log "WARN: trustcache add node failed"
+  fi
+fi
+
 if [ ! -f "$P/lib/fetch-shim.cjs" ]; then
   log "WARN: /usr/local/lib/fetch-shim.cjs missing - dsh will not start"
 fi

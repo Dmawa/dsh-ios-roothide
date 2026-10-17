@@ -122,9 +122,32 @@ CTRL
 cat > /tmp/nodejs-deb/DEBIAN/postinst <<'CTRL'
 #!/bin/sh
 P=/usr/local
+# /rootfs is rootHide's view of the real root; on a plain rootless jailbreak it
+# does not exist, so fall back to the plain path.
 LOG=/rootfs/var/mobile/.dsh/postinst.log
-mkdir -p "$(dirname "$LOG")" 2>/dev/null
+mkdir -p "$(dirname "$LOG")" 2>/dev/null || {
+  LOG=/var/mobile/.dsh/postinst.log
+  mkdir -p "$(dirname "$LOG")" 2>/dev/null
+}
 log(){ echo "[nodejs postinst $(date +%H:%M:%S)] $*" >> "$LOG" 2>/dev/null; }
+
+# rootHide keeps ldid/jbctl outside the default PATH, under the (randomly named)
+# jbroot. Without this the postinst aborts and the user is left re-signing node
+# by hand - which is exactly the manual step we are trying to remove.
+JB=""
+if command -v jbroot >/dev/null 2>&1; then
+  JB="$(jbroot 2>/dev/null)" || JB=""
+fi
+[ -n "$JB" ] || JB="${JBROOT:-}"
+[ -n "$JB" ] || JB="/"
+for d in basebin usr/bin usr/local/bin; do
+  [ -d "${JB}$d" ] && PATH="${JB}$d:$PATH"
+done
+for d in /var/jb/basebin /var/jb/usr/bin; do
+  [ -d "$d" ] && PATH="$d:$PATH"
+done
+export PATH
+
 chmod 755 "$P/bin/node" >>"$LOG" 2>&1 || { log "ERROR: chmod node failed"; exit 1; }
 if command -v ldid >/dev/null 2>&1; then
   if ldid -M -S"$P/lib/nodejs/entitlements.plist" "$P/bin/node" >>"$LOG" 2>&1; then
