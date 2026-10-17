@@ -42,7 +42,9 @@ jobs:
           path: |
             node-v22.23.2
             .ccache
-          key: node-ios-build-${{ runner.arch }}-${{ hashFiles('scripts/ios/apply_patches.py', 'scripts/ios/build-*.sh', 'ios-sdk-shim/**') }}
+          # Only node-side inputs: a change to build-dsh-ios.sh (packaging) must not
+          # invalidate the 2h Node cross-compile.
+          key: node-ios-build-${{ runner.arch }}-${{ hashFiles('scripts/ios/apply_patches.py', 'scripts/ios/build-node-ios.sh', 'ios-sdk-shim/**') }}
           restore-keys: |
             node-ios-build-${{ runner.arch }}-
 
@@ -68,12 +70,31 @@ jobs:
           ls "dist/dsh-ios_${DSH_VER}-1_iphoneos-arm64e.deb"
           echo "dsh version: $DSH_VER"
 
-      - name: 上传 deb 产物
+      # The artifact service times out often enough to have cost us a full build
+      # once. It is a convenience; the Release below is the real delivery path.
+      - name: 上传 deb 产物（失败不致命）
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: dsh-ios-debs
           path: dist/*.deb
           if-no-files-found: error
+
+      - name: 发布到 Release（产物兜底，始终执行）
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          ls -l dist/*.deb
+          TAG=dsh-ios-latest
+          gh release view "$TAG" >/dev/null 2>&1 || \
+            gh release create "$TAG" \
+              --title "dsh-ios (latest)" \
+              --notes "Automated build of $GITHUB_SHA" \
+              --prerelease
+          gh release upload "$TAG" dist/*.deb --clobber
+          echo "https://github.com/$GITHUB_REPOSITORY/releases/tag/$TAG"
 
       - name: 发布到 Release（仅 tag 触发时）
         if: startsWith(github.ref, 'refs/tags/')
