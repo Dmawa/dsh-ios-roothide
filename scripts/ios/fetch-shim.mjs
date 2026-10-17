@@ -389,15 +389,132 @@ async function iosFetch(input, init) {
 }
 
 // ---------------------------------------------------------------------------
+// Blob / File / FormData and the event classes are ALSO undici-backed globals in
+// Node 22. Touching any of them (attachment upload, multipart body) loads undici
+// just like touching fetch does, so they have to be taken over as well.
+// ---------------------------------------------------------------------------
+class Blob {
+  #parts;
+  constructor(parts = [], options = {}) {
+    this.#parts = Array.isArray(parts) ? parts : [parts];
+    this.type = String(options.type || "");
+  }
+  get size() {
+    let n = 0;
+    for (const part of this.#parts) {
+      if (typeof part === "string") n += Buffer.byteLength(part);
+      else if (part instanceof ArrayBuffer) n += part.byteLength;
+      else if (ArrayBuffer.isView(part)) n += part.byteLength;
+      else if (part instanceof Blob) n += part.size;
+      else n += Buffer.byteLength(String(part));
+    }
+    return n;
+  }
+  #bytes() {
+    const chunks = [];
+    for (const part of this.#parts) {
+      if (typeof part === "string") chunks.push(Buffer.from(part));
+      else if (part instanceof ArrayBuffer) chunks.push(Buffer.from(part));
+      else if (ArrayBuffer.isView(part)) chunks.push(Buffer.from(part.buffer, part.byteOffset, part.byteLength));
+      else if (part instanceof Blob) chunks.push(part.#bytes());
+      else chunks.push(Buffer.from(String(part)));
+    }
+    return Buffer.concat(chunks);
+  }
+  async arrayBuffer() {
+    const bytes = this.#bytes();
+    return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+  }
+  async text() { return this.#bytes().toString("utf8"); }
+  async bytes_() { return new Uint8Array(this.#bytes()); }
+  stream() {
+    const bytes = this.#bytes();
+    return new ReadableStream({
+      start(controller) {
+        if (bytes.length) controller.enqueue(new Uint8Array(bytes));
+        controller.close();
+      },
+    });
+  }
+  slice(start, end, type) {
+    const bytes = this.#bytes().subarray(start, end);
+    return new Blob([bytes], { type: type || this.type });
+  }
+}
+
+class File extends Blob {
+  constructor(parts, name, options = {}) {
+    super(parts, options);
+    this.name = String(name);
+    this.lastModified = options.lastModified === undefined ? Date.now() : Number(options.lastModified);
+  }
+}
+
+class FormData {
+  #entries = [];
+  append(name, value, filename) {
+    this.#entries.push([String(name), value, filename]);
+  }
+  set(name, value, filename) {
+    this.delete(name);
+    this.append(name, value, filename);
+  }
+  get(name) {
+    const hit = this.#entries.find((e) => e[0] === String(name));
+    return hit ? hit[1] : null;
+  }
+  getAll(name) {
+    return this.#entries.filter((e) => e[0] === String(name)).map((e) => e[1]);
+  }
+  has(name) { return this.#entries.some((e) => e[0] === String(name)); }
+  delete(name) { this.#entries = this.#entries.filter((e) => e[0] !== String(name)); }
+  *entries() { for (const [k, v] of this.#entries) yield [k, v]; }
+  *keys() { for (const [k] of this.#entries) yield k; }
+  *values() { for (const [, v] of this.#entries) yield v; }
+  [Symbol.iterator]() { return this.entries(); }
+  forEach(cb, thisArg) { for (const [k, v] of this.#entries) cb.call(thisArg, v, k, this); }
+}
+
+class MessageEvent {
+  constructor(type, init = {}) {
+    this.type = String(type);
+    this.data = init.data === undefined ? null : init.data;
+    this.origin = init.origin || "";
+  }
+}
+class CloseEvent {
+  constructor(type, init = {}) {
+    this.type = String(type);
+    this.code = init.code === undefined ? 0 : Number(init.code);
+    this.reason = init.reason || "";
+    this.wasClean = Boolean(init.wasClean);
+  }
+}
+
+// No WebSocket implementation on this build; fail loudly instead of silently
+// loading undici's.
+class WebSocket {
+  constructor() {
+    throw new Error("WebSocket is not available on this iOS build (undici-free shim)");
+  }
+}
+// ---------------------------------------------------------------------------
 // Take over the globals BEFORE Node's lazy undici getters can fire.
 // ---------------------------------------------------------------------------
+const installed = [];
+const failed = [];
 function define(name, value) {
   try {
     Object.defineProperty(globalThis, name, {
       value, writable: true, configurable: true, enumerable: false,
     });
-  } catch {
-    globalThis[name] = value;
+    const after = Object.getOwnPropertyDescriptor(globalThis, name);
+    if (after && after.value === value) installed.push(name);
+    else failed.push(name + " (descriptor mismatch)");
+  } catch (err) {
+    // Do NOT fall back to assignment: on an accessor-only global that would
+    // invoke the very undici getter we are trying to avoid.
+    failed.push(name + " (" + err.message + ")");
   }
 }
 
@@ -405,7 +522,21 @@ define("Headers", Headers);
 define("Request", Request);
 define("Response", Response);
 define("fetch", iosFetch);
+define("Blob", Blob);
+define("File", File);
+define("FormData", FormData);
+define("MessageEvent", MessageEvent);
+define("CloseEvent", CloseEvent);
+define("WebSocket", WebSocket);
+
+// Always expose the install result so a device-side smoke test can assert it:
+//     node --jitless --import <shim> -e "console.log(globalThis.__dshShim)"
+Object.defineProperty(globalThis, "__dshShim", {
+  value: { installed: installed.slice(), failed: failed.slice() },
+  writable: false, configurable: true, enumerable: false,
+});
 
 if (process.env.DSH_IOS_SHIM_VERBOSE === "1") {
-  console.error("[fetch-shim] undici-free globals installed (--jitless safe)");
+  console.error("[fetch-shim] installed:", installed.join(", "));
+  if (failed.length) console.error("[fetch-shim] FAILED:", failed.join(", "));
 }
