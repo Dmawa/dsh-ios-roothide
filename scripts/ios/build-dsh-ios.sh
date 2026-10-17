@@ -200,6 +200,115 @@ EOF
   fi
 fi
 
+# ---- undici 桩 ----------------------------------------------------------
+# dsh-web-fetch-http 和 dsh-http-proxy 会 `await import("undici")`。真 undici 的
+# llhttp 是编译成 WebAssembly 的，在 --jitless 下必崩（本机 JIT 也不可用）。
+# 它们只用到 Agent / Pool / ProxyAgent / get|setGlobalDispatcher / fetch，
+# 所以整包换成桩：dispatcher 退化成 no-op，fetch 转发到我们的 node:http 实现
+# （--import 的 fetch-shim.mjs 已经装好）。
+rm -rf "$NM/undici"
+mkdir -p "$NM/undici"
+cat > "$NM/undici/package.json" <<'EOF'
+{
+  "name": "undici",
+  "version": "0.0.0-ios-stub",
+  "description": "iOS stub: real undici needs WebAssembly (llhttp), unavailable under --jitless",
+  "main": "index.cjs",
+  "exports": { ".": { "import": "./index.mjs", "require": "./index.cjs" } }
+}
+EOF
+cat > "$NM/undici/index.mjs" <<'EOF'
+// undici stub for jailbroken iOS.
+// Real undici compiles llhttp to WebAssembly; --jitless (required on this
+// device because the patched V8 W^X path SIGBUSes) leaves no WebAssembly, so the
+// real module cannot load. dsh only needs dispatchers + fetch; dispatchers are
+// meaningless here because fetch_shim.mjs talks to node:http directly.
+
+class Dispatcher {
+  constructor(options) { this.options = options || {}; }
+  dispatch() { return false; }
+  close() { return Promise.resolve(); }
+  destroy() { return Promise.resolve(); }
+}
+
+export class Agent extends Dispatcher {}
+export class Pool extends Dispatcher {}
+export class ProxyAgent extends Dispatcher {}
+export class Client extends Dispatcher {}
+
+let globalDispatcher = new Agent();
+export function getGlobalDispatcher() { return globalDispatcher; }
+export function setGlobalDispatcher(dispatcher) { globalDispatcher = dispatcher; }
+
+export function fetch(input, init) {
+  const { dispatcher, ...rest } = init || {};
+  return globalThis.fetch(input, rest);
+}
+export function request() {
+  throw new Error("undici.request is not available on this iOS build (use fetch)");
+}
+export function stream() {
+  throw new Error("undici.stream is not available on this iOS build (use fetch)");
+}
+
+export const Headers = globalThis.Headers;
+export const Request = globalThis.Request;
+export const Response = globalThis.Response;
+export const FormData = globalThis.FormData;
+export const errors = {};
+
+export default {
+  Agent, Pool, ProxyAgent, Client, Dispatcher,
+  getGlobalDispatcher, setGlobalDispatcher, fetch, request, stream,
+  Headers, Request, Response, FormData, errors,
+};
+EOF
+cat > "$NM/undici/index.cjs" <<'EOF'
+"use strict";
+// CJS twin of index.mjs (see the comment there).
+class Dispatcher {
+  constructor(options) { this.options = options || {}; }
+  dispatch() { return false; }
+  close() { return Promise.resolve(); }
+  destroy() { return Promise.resolve(); }
+}
+class Agent extends Dispatcher {}
+class Pool extends Dispatcher {}
+class ProxyAgent extends Dispatcher {}
+class Client extends Dispatcher {}
+let globalDispatcher = new Agent();
+function getGlobalDispatcher() { return globalDispatcher; }
+function setGlobalDispatcher(d) { globalDispatcher = d; }
+function fetch(input, init) {
+  const rest = Object.assign({}, init);
+  delete rest.dispatcher;
+  return globalThis.fetch(input, rest);
+}
+function unsupported(name) {
+  return function () {
+    throw new Error("undici." + name + " is not available on this iOS build (use fetch)");
+  };
+}
+const mod = {
+  Agent, Pool, ProxyAgent, Client, Dispatcher,
+  getGlobalDispatcher, setGlobalDispatcher, fetch,
+  request: unsupported("request"), stream: unsupported("stream"),
+  Headers: globalThis.Headers, Request: globalThis.Request,
+  Response: globalThis.Response, FormData: globalThis.FormData,
+  errors: {},
+};
+module.exports = mod;
+module.exports.default = mod;
+module.exports.Agent = Agent;
+module.exports.Pool = Pool;
+module.exports.ProxyAgent = ProxyAgent;
+module.exports.Client = Client;
+module.exports.fetch = fetch;
+module.exports.getGlobalDispatcher = getGlobalDispatcher;
+module.exports.setGlobalDispatcher = setGlobalDispatcher;
+module.exports.request = mod.request;
+module.exports.stream = mod.stream;
+EOF
 # 前端 polyfill（iOS 16.7 Safari 缺 AbortSignal.any）
 python3 "$SCRIPT_DIR/inject-web-polyfill.py" "$NM"
 
@@ -392,6 +501,7 @@ echo "== [6/6] 打包前自检 =="
 fail=0
 check(){ if [ -e "$1" ]; then echo "  ok   $2"; else echo "  MISS $2"; fail=1; fi; }
 check "$DEB/usr/local/lib/fetch-shim.mjs" "fetch-shim.mjs"
+check "$DEB/usr/local/lib/node_modules/undici/index.mjs" "undici stub"
 check "$DEB/usr/local/bin/dsh-ios" "launcher dsh-ios"
 check "$DEB/usr/local/lib/node_modules/@deepseek-ai/dsh/lib/bin.js" "dsh entry"
 check "$DEB/usr/local/lib/node_modules/node-pty/build/Release/pty.node" "node-pty addon"
