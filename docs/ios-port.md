@@ -208,6 +208,16 @@ node --jitless --predictable --single-threaded --expose-internals \
      "$(jbroot /usr/local/lib/node_modules/@deepseek-ai/dsh/lib/bin.js)" web --no-open
 ```
 
+**rootHide 适配清单**（全部在 launcher / postinst 里）：
+
+| 问题 | 处理 |
+|---|---|
+| shell 与 node 看到的文件系统不是同一个视图 | `jbroot` 翻译 node / 入口 / 垫片的路径 |
+| 真实根目录的 `/bin` 几乎是空的，node 没有路径插桩 | `PATH` 前置 `${jbroot}usr/bin:${jbroot}bin:...`，否则 spawn 全 ENOENT（看着像沙箱拒绝，其实是路径不存在） |
+| `ldid` / `jbctl` 在 `$JBROOT/basebin` | postinst 先补 PATH 再签名 / 加 trustcache |
+| 原生 `.node` 不能放在真实文件系统的用户目录（沙箱拒绝 mmap 可执行页） | deb 装进 `/usr/local/...`，由 rootHide 映射进 jbroot |
+| shebang 解释器在两种视图下都不稳定 | postinst 提示：失败就用 `sh /usr/local/bin/dsh-ios` |
+
 **为什么默认 `--jitless`**：作者的 V8 W^X 补丁只在 A14 上验证过；A 系列之外的设备（如 M1 iPad）
 开 JIT 会 SIGBUS。功能不受影响，只是 JS 慢一些。确认自己设备能开 JIT 时用 `DSH_IOS_JIT=1 dsh-ios`
 切回快路径。

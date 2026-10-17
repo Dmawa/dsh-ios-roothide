@@ -29,6 +29,7 @@ jobs:
           bash -n scripts/ios/build-dsh-ios.sh
           node --check scripts/ios/fetch-shim.cjs
           python3 -m py_compile scripts/ios/apply_patches.py scripts/ios/inject-web-polyfill.py
+          node --test scripts/ios/test/
           echo "syntax ok"
 
       - name: 安装 ninja + ccache + dpkg

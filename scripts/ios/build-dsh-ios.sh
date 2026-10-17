@@ -221,21 +221,24 @@ chmod 644 "$DEB/usr/local/lib/fetch-shim.cjs"
 # 想赌一把 JIT 就 DSH_IOS_JIT=1 dsh-ios。
 cat > "$DEB/usr/local/bin/dsh" <<'EOF'
 #!/bin/sh
-# dsh — DeepSeek Harness on jailbroken iOS (RootHide / rootless aware)
+# dsh — DeepSeek Harness on jailbroken iOS (rootHide / rootless aware)
+#
+# rootHide answers "where is /usr/local?" two different ways: a jailbreak shell
+# sees the merged, jbroot-prefixed view; a plain iOS process like node sees the
+# real root. Every path handed to node must be translated, or it ENOENTs.
 
-jb() {
-  if command -v jbroot >/dev/null 2>&1; then
-    jbroot "$1"
-  elif [ -n "${JBROOT:-}" ] && [ -e "${JBROOT}$1" ]; then
-    printf '%s\n' "${JBROOT}$1"
-  else
-    printf '%s\n' "$1"
-  fi
-}
+JB=""
+if command -v jbroot >/dev/null 2>&1; then
+  JB="$(jbroot 2>/dev/null)" || JB=""
+fi
+if [ -z "$JB" ]; then
+  JB="${JBROOT:-}"
+fi
+[ -n "$JB" ] || JB="/"
 
-NODE=$(jb /usr/local/bin/node)
-ENTRY=$(jb /usr/local/lib/node_modules/@deepseek-ai/dsh/lib/bin.js)
-SHIM=$(jb /usr/local/lib/fetch-shim.cjs)
+NODE="${JB}usr/local/bin/node"
+ENTRY="${JB}usr/local/lib/node_modules/@deepseek-ai/dsh/lib/bin.js"
+SHIM="${JB}usr/local/lib/fetch-shim.cjs"
 
 if [ ! -x "$NODE" ]; then
   echo "dsh: node not found at $NODE (install the nodejs package first)" >&2
@@ -246,8 +249,13 @@ if [ ! -f "$SHIM" ]; then
   exit 127
 fi
 
+# The real root has almost nothing in /bin — the jailbreak userland lives under
+# jbroot. node does not get rootHide's path interposition, so everything it
+# spawns (the bash tool, node-pty's shell) only resolves if the jbroot bin
+# directories are on PATH. Without this, spawn fails with ENOENT and it looks
+# like a sandbox denial.
+export PATH="${JB}usr/bin:${JB}bin:${JB}usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
 export DSH_HOME="${DSH_HOME:-${HOME:-/var/mobile}/.dsh}"
-export PATH="$(dirname "$NODE"):$PATH"
 
 # --predictable --single-threaded: required by the patched V8 W^X path.
 FLAGS="--predictable --single-threaded"
@@ -283,17 +291,26 @@ cat > "$DEB/DEBIAN/postinst" <<'CTRL'
 #  - register them in the trust cache (RootHide: jbctl lives under $JBROOT/basebin)
 P=/usr/local
 REL="$P/lib/node_modules/node-pty/build/Release"
+# /rootfs is rootHide's view of the real root; on a plain rootless jailbreak it
+# does not exist, so fall back to the plain path.
 LOG=/rootfs/var/mobile/.dsh/postinst.log
-mkdir -p "$(dirname "$LOG")" 2>/dev/null
+mkdir -p "$(dirname "$LOG")" 2>/dev/null || {
+  LOG=/var/mobile/.dsh/postinst.log
+  mkdir -p "$(dirname "$LOG")" 2>/dev/null
+}
 log(){ echo "[dsh-ios postinst $(date +%H:%M:%S)] $*" >> "$LOG" 2>/dev/null; }
 
-# RootHide keeps ldid/jbctl outside the default PATH.
+# rootHide keeps ldid/jbctl outside the default PATH, under the (randomly named)
+# jbroot. `jbroot` with no argument prints that root, trailing slash included.
+JB=""
 if command -v jbroot >/dev/null 2>&1; then
-  for d in basebin usr/bin usr/local/bin; do
-    p=$(jbroot "/$d" 2>/dev/null) || continue
-    [ -d "$p" ] && PATH="$p:$PATH"
-  done
+  JB="$(jbroot 2>/dev/null)" || JB=""
 fi
+[ -n "$JB" ] || JB="${JBROOT:-}"
+[ -n "$JB" ] || JB="/"
+for d in basebin usr/bin usr/local/bin; do
+  [ -d "${JB}$d" ] && PATH="${JB}$d:$PATH"
+done
 for d in /var/jb/basebin /var/jb/usr/bin; do
   [ -d "$d" ] && PATH="$d:$PATH"
 done
@@ -325,7 +342,10 @@ else
   log "WARN: jbctl not found - trustcache registration skipped"
 fi
 
-echo "dsh-ios installed. Run 'dsh-ios' and open http://127.0.0.1:3080 in Safari."
+echo "dsh-ios installed."
+echo "  start:  dsh-ios"
+echo "  (if that fails with a bad-interpreter error, run: sh /usr/local/bin/dsh-ios)"
+echo "  then open http://127.0.0.1:3080 in Safari"
 exit 0
 CTRL
 chmod 755 "$DEB/DEBIAN/postinst"
