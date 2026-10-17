@@ -395,7 +395,7 @@ grep -q 'dsh-ios-polyfill' "$DEB/usr/local/lib/node_modules/@deepseek-ai/dsh-web
   && echo "  ok   web polyfill" || { echo "  MISS web polyfill"; fail=1; }
 grep -q 'fetch-shim.mjs' "$DEB/usr/local/bin/dsh" \
   && echo "  ok   launcher imports fetch-shim" || { echo "  MISS launcher fetch-shim wiring"; fail=1; }
-grep -q '--import' "$DEB/usr/local/bin/dsh" \
+grep -q -e '--import' "$DEB/usr/local/bin/dsh" \
   && echo "  ok   launcher uses --import (ESM preload)" || { echo "  MISS --import"; fail=1; }
 if [ "$fail" != "0" ]; then echo "打包自检失败"; exit 1; fi
 
