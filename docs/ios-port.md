@@ -84,6 +84,17 @@ Node 使用 `scripts/ios/node-jit-entitlements.plist` 中的 `dynamic-codesignin
     后续 7 处 `HANDLE_EINTR` 报 `undeclared`。已修（`#if`/`#endif` 平衡，19/19）。
     同时把 node-gyp 失败从 `>/dev/null 2>&1 || true` 改为吐真实日志。
 
+## ICU 是硬性前提（12 个插件全红的根因）
+
+`build-node-ios.sh` 原来用的是 `--with-intl=none`。dsh 的插件链在几百处使用 Unicode 属性转义
+（`\p{L}`、`\p{XID_Start}`、`\p{XID_Continue}`…），**没有 ICU 数据时这些正则字面量在模块求值阶段
+就抛 `SyntaxError: Invalid regular expression`**，表现就是启动时"所有插件 failed to import"。
+
+现在改为 `--with-intl=small-icu`（与 xlpoistop-prog/dsh-ios 一致）。small-icu 只裁掉 locale 数据，
+Unicode 属性表仍然完整，`\p{...}` 可用，代价是 node 二进制大一些。
+
+> 排查提示：`node -e "console.log(process.versions.icu)"` —— 打印 `undefined` 就说明这个构建没带 ICU。
+
 ## 运行时垫片（fetch-shim）
 
 **背景**：dsh 0.1.1 的 HTTP 客户端是 node 内建 **undici**，其 HTTP parser（llhttp）由 **WebAssembly** 编译；
@@ -98,6 +109,11 @@ A14 上 wasm 双路径都崩（见上），且 `--jitless` 时代还叠加 wasm 
 - **不要**加 `--no-experimental-fetch` / `--no-experimental-websocket`：它们会把 undici 的
   `Request`/`Response`/`Headers` **全局类也禁掉**，dsh 插件树（webRuntime→connection→apiProxy 链）
   启动时依赖这些类 → apiProxy 服务静默不激活 → 所有 `/api/*` 返回 404
+
+> **坑：`globalThis.fetch = fn` 是错的。** Node 把 `fetch` 装成了惰性 getter，普通赋值会先读旧值，
+> 从而把 undici 加载进来——正是会崩的那个模块，垫片看起来"完全没生效"。必须用
+> `Object.defineProperty(globalThis, "fetch", { value, configurable: true, writable: true })`。
+> （这条来自 xlpoistop-prog/dsh-ios 的 `docs/ios-constraints.md` §3。）
 
 **垫片现在随包发布**：源码在 `scripts/ios/fetch-shim.cjs`，构建时复制到 `/usr/local/lib/fetch-shim.cjs`，
 并由 `/usr/local/bin/dsh` 用 `--require` 预加载。打包自检（`build-dsh-ios.sh` 第 6 步）会校验它确实在包里、

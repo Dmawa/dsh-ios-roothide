@@ -152,3 +152,21 @@ GitHub Actions (macos-15-intel, .github/workflows/build-dsh-ios.yml)
 2. 若插件仍被 koffi 挡住，用 `DSH_IOS_STUB_PLUGINS=1` 重出包。
 3. JIT 在 M1 上的崩溃没定位（需要崩溃报告），目前 `--jitless` 兜底。
 4. 清掉 12 个 dependabot PR，打第一个 tag + Release。
+
+## 11. 第二轮改动（2026-10-17，对照 xlpoistop-prog/dsh-ios 之后）
+
+本移植与 `xlpoistop-prog/dsh-ios` 同源（同样的 `build-node-ios.sh` / `entitlements.plist` /
+`ios-sdk-shim/mach/mach_vm.h` / V8 补丁结构）。对照它的 `docs/ios-constraints.md` 后补了三处：
+
+1. **ICU（根因）**：`build-node-ios.sh` 的 `--with-intl=none` → `--with-intl=small-icu`。
+   没有 ICU，`\p{XID_Start}` 这类正则字面量在 import 阶段就抛 SyntaxError，dsh-tools 被 30 个包
+   引用，于是所有插件全红。这才是"12 个插件 failed to import"的真正原因，与 dsh 版本无关。
+2. **`fetch` 必须用 defineProperty 覆盖**：Node 的 `fetch` 是惰性 getter，直接赋值会先触发
+   getter → 加载 undici → 崩。改成 `Object.defineProperty`。
+3. **前端 polyfill 补全**：除 `AbortSignal.any/timeout` 外，补 `Iterator` helpers（Safari 18.4 才有，
+   而 dsh 前端用 `typeof Iterator.prototype.join !== 'function'` 做特性检测，全局不存在时直接
+   ReferenceError）、`Promise.withResolvers`、`Object/Map.groupBy`、`Array.fromAsync`。
+   实现来自 `scripts/ios/web-polyfill.js`，由 `inject-web-polyfill.py` 注入 index.html。
+
+经核对，0.1.7 里 **不需要** 额外 stub：koffi 已是 `await import()` 惰性加载，`dsh-win32-process`
+的 ABI 断言在函数内，`node-addon-system/flock` 没有任何包引用。

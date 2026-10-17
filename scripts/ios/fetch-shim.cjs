@@ -283,7 +283,16 @@ async function iosFetch(input, init) {
   }
 }
 
-globalThis.fetch = iosFetch;
+// Node installs `fetch` as a LAZY GETTER: a plain assignment
+// (`globalThis.fetch = iosFetch`) reads the existing value first, which loads
+// undici — the very module whose wasm llhttp dies on this device. The polyfill
+// then looks "ignored". defineProperty bypasses the getter entirely.
+Object.defineProperty(globalThis, "fetch", {
+  value: iosFetch,
+  writable: true,
+  configurable: true,
+  enumerable: false,
+});
 
 if (process.env.DSH_IOS_SHIM_VERBOSE === "1") {
   console.error("[fetch-shim] installed (wasm stubbed, fetch -> node:http)");

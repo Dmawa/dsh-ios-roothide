@@ -65,7 +65,11 @@ export CC="/usr/bin/clang -target arm64-apple-ios16.0 -isysroot $SDK -miphoneos-
 export CXX="/usr/bin/clang++ -target arm64-apple-ios16.0 -isysroot $SDK -miphoneos-version-min=16.0 -stdlib=libc++ -std=gnu++20 -I$SHIM"
 export CC_host=/usr/bin/clang
 export CXX_host="/usr/bin/clang++ -std=gnu++20"
-./configure --dest-os=ios --dest-cpu=arm64 --with-intl=none --prefix=/usr/local --openssl-no-asm --ninja
+# --with-intl=small-icu 不是可选项：dsh 的插件链在几百处使用 Unicode 属性转义
+# (\p{L}, \p{XID_Start}, ...)，没有 ICU 数据时这些正则字面量会在模块求值阶段直接抛
+# SyntaxError: Invalid regular expression —— 表现为「所有插件 failed to import」。
+# 之前这里是 --with-intl=none，正是 12 个插件全红的根因。
+./configure --dest-os=ios --dest-cpu=arm64 --with-intl=small-icu --prefix=/usr/local --openssl-no-asm --ninja
 
 echo "== [4/6] ninja host 生成器去冲突（configure 后必做）=="
 cd out/Release
